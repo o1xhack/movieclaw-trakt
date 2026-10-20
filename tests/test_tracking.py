@@ -316,3 +316,31 @@ async def test_seek_near_end_start_is_never_converted_to_watched_history(harness
     await e.drain(0)
     assert requests == []
     assert not (await e.status(0))["pending"]
+
+
+async def test_short_stop_422_is_expected_noop_not_matching_failure(harness, event):
+    e, _, clock, requests = await harness(lambda r: httpx.Response(422))
+    await e.accept("stopped", {**event, "position_ms": 0}, "short", iso_time(clock[0]))
+    await e.drain(0)
+    status = await e.status(0)
+    assert requests[0].url.path == "/scrobble/stop"
+    assert status["pending"] == status["failed"] == 0
+    assert not status["last_error"]
+
+
+async def test_ordinary_422_keeps_failure_visible(harness, event):
+    e, _, clock, _ = await harness(lambda r: httpx.Response(422))
+    await e.accept("stopped", event, "invalid", iso_time(clock[0]))
+    await e.drain(0)
+    assert (await e.status(0))["failed"] == 1
+
+
+async def test_legacy_short_pause_queue_can_be_retried_without_false_alarm(harness, event):
+    e, _, clock, _ = await harness(lambda r: httpx.Response(422))
+    await e.accept("stopped", {**event, "position_ms": 0}, "legacy", iso_time(clock[0]))
+    ledger = await e.ledger(0)
+    ledger["queue"][0]["path"] = "/scrobble/pause"
+    await e.save_ledger(0, ledger)
+    await e.drain(0)
+    assert (await e.status(0))["failed"] == 0
+    assert (await e.status(0))["last_success"]

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Treat Trakt HTTP 422 for stops below 1% as the documented short-play no-op, rather than a media-matching failure. Covers queued pause requests from earlier versions too.
+- Use the stop endpoint for player exits at every progress value.
+
 ## 0.1.1
 
 - Accept the official `auth.trakt.tv` device authorization hostname returned by the live Trakt API, alongside `trakt.tv` and `app.trakt.tv`; keep rejecting unrelated domains.

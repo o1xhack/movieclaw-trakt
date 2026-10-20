@@ -26,7 +26,7 @@ class TraktClient:
         headers = {
             "trakt-api-version": "2",
             "trakt-api-key": self.client_id,
-            "User-Agent": "MovieClaw-Trakt/0.1.1",
+            "User-Agent": "MovieClaw-Trakt/0.1.2",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -60,7 +60,11 @@ class TraktClient:
     async def begin(self):
         result = await self.request("POST", "/oauth/device/code", {"client_id": self.client_id})
         url = urlparse(result.get("verification_url", ""))
-        if url.scheme != "https" or url.hostname not in {"trakt.tv", "app.trakt.tv", "auth.trakt.tv"}:
+        if url.scheme != "https" or url.hostname not in {
+            "trakt.tv",
+            "app.trakt.tv",
+            "auth.trakt.tv",
+        }:
             raise TraktError(502)
         if not result.get("device_code") or not result.get("user_code"):
             raise TraktError(502)

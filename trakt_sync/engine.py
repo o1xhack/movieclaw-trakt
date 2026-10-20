@@ -174,7 +174,7 @@ class Engine:
                         if rate > 80:
                             state["terminal_at"] = at
                         request = {
-                            "path": "/scrobble/stop" if rate >= 1 else "/scrobble/pause",
+                            "path": "/scrobble/stop",
                             "body": {**item, "progress": rate},
                         }
                     elif kind == "progress" and rate is not None:
@@ -316,7 +316,14 @@ class Engine:
                         if any(result["not_found"].values()):
                             raise TraktError(404)
             except TraktError as exc:
-                if exc.status == 409 and job["path"] == "/scrobble/stop":
+                if (
+                    exc.status == 422
+                    and job["path"] in ("/scrobble/stop", "/scrobble/pause")
+                    and 0 <= job["body"].get("progress", -1) < 1
+                ):
+                    # Trakt 会清除 watching，但不足 1% 的停止不保存进度，按协议返回 422。
+                    result = {"action": "ignored_short_play"}
+                elif exc.status == 409 and job["path"] == "/scrobble/stop":
                     result = {"action": "already_synced"}
                 elif exc.status in (404, 422):
                     # 无法匹配的一部片不能阻塞后面所有播放，保留可手动重试的失败记录。
