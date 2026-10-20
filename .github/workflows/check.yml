@@ -17,7 +17,7 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements-dev.txt
       - run: ruff check trakt_sync tests scripts
-      - run: pytest -q
+      - run: python -m pytest -q
         env:
           PYTHONPATH: .sdk/src
       - run: python scripts/package.py
