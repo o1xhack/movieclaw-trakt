@@ -1,0 +1,13 @@
+[project]
+name = "movieclaw-trakt"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "A self-hosted Trakt playback tracking plugin for MovieClaw"
+license = "MIT"
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 100
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

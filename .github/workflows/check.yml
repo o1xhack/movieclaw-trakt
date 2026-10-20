@@ -1,0 +1,27 @@
+name: Check plugin
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: movieclaw/MovieClaw
+          ref: v0.41.0
+          path: .sdk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check trakt_sync tests scripts
+      - run: pytest -q
+        env:
+          PYTHONPATH: .sdk/src
+      - run: python scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trakt-sync
+          path: dist/*

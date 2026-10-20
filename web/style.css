@@ -1,0 +1,7 @@
+:root{color-scheme:dark;font-family:var(--mc-font,system-ui,sans-serif);color:var(--mc-text,#eee)}
+body{margin:0;background:transparent}main{max-width:680px;margin:auto;padding:24px}p{line-height:1.6;color:var(--mc-text-muted,#aaa)}
+section{border:1px solid var(--mc-line,#444);border-radius:16px;margin:20px 0;padding:20px}h1{font-size:28px}h2{font-size:19px}
+input,button{font:inherit;border:1px solid var(--mc-line,#555);border-radius:9px;padding:10px 14px;margin:8px 8px 0 0}
+input{background:transparent;color:inherit;width:90px}label{display:block}button{cursor:pointer;background:transparent;color:inherit}
+button:disabled{opacity:.5;cursor:default}a{color:var(--mc-accent,#a9bcff)}#code{display:block;font:700 30px monospace;letter-spacing:4px}
+#error{color:var(--mc-danger,#ffaaaa)}.hint,footer{font-size:14px}
