@@ -90,3 +90,22 @@ async def test_no_untrusted_oauth_links(harness, url):
     await store.delete("account", scope="member:0")
     with pytest.raises(TraktError):
         await e.begin(0)
+
+
+async def test_official_auth_subdomain_returned_by_live_device_endpoint(harness):
+    e, store, _, _ = await harness(
+        lambda r: httpx.Response(
+            200,
+            json={
+                "device_code": "fixture-device",
+                "user_code": "TEST1234",
+                "verification_url": "https://auth.trakt.tv/activate",
+                "interval": 5,
+                "expires_in": 600,
+            },
+        )
+    )
+    await store.delete("account", scope="member:0")
+    result = await e.begin(0)
+    assert result["verification_url"] == "https://auth.trakt.tv/activate"
+    assert "device_code" not in result

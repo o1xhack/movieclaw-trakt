@@ -37,7 +37,7 @@ $("connect").onclick = action(async () => {
   const auth = await api("auth/begin", "POST", id);
   if (own !== generation) return;
   const url = new URL(auth.verification_url);
-  if (url.protocol !== "https:" || !["trakt.tv", "app.trakt.tv"].includes(url.hostname)) throw new Error("授权地址无效");
+  if (url.protocol !== "https:" || !["trakt.tv", "app.trakt.tv", "auth.trakt.tv"].includes(url.hostname)) throw new Error("授权地址无效");
   $("verify").href = url.href; $("code").textContent = auth.user_code;
   $("authorization").hidden = false; $("auth-state").textContent = "等待你在 Trakt 确认授权…";
   let interval = auth.interval;
