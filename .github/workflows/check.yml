@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: o1xhack/movieclaw
-          ref: 3e9c15dff5a59105f1f69e1afa3af617a7f43968 # companion history API proposal
+          ref: fa86474e596d7e9383a15e3b95088ea3c4f9e35c # companion history API proposal
           path: .sdk
       - uses: actions/setup-python@v5
         with:

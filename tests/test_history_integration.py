@@ -1,7 +1,9 @@
 """Real host SQLite + HostOps HTTP gateway + plugin routes. Only Trakt is mocked."""
 
 import importlib
+import json
 import os
+from datetime import datetime
 from types import SimpleNamespace
 
 import httpx
@@ -112,6 +114,18 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     duration_seconds=600,
                 )
             )
+            s.add(
+                PlaybackState(
+                    member_id=2,
+                    media_item_id=media.id,
+                    position_ms=120000,
+                    last_played_at=datetime(2020, 1, 2, 12),
+                    is_favorite=True,
+                    audio_track="1",
+                    subtitle_track="off",
+                    play_count=5,
+                )
+            )
             await s.commit()
         ops = HostOps(app)
         ops.configure("trakt-sync", grants=["playback.sync.catalog", "playback.sync.import"])
@@ -189,6 +203,11 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                         len(states) == 1
                         and states[0].last_played_at.year == 2020
                         and states[0].played
+                        and states[0].position_ms == 0
+                        and states[0].is_favorite
+                        and states[0].audio_track == "1"
+                        and states[0].subtitle_track == "off"
+                        and states[0].play_count == 5
                     )
                 data = await call(f"/{task['id']}?records=true")
                 assert len(data["items"]) == 3
@@ -208,6 +227,66 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                         break
                 assert exported["done"] == 3
                 assert not [r for r in requests if r.method == "POST"]
+                # Real identity correction + cleanup must retain every imported watch and source key.
+                async with get_database().session() as s:
+                    corrected = MediaItem(
+                        kind="movie", title="Corrected", original_title="Fixture", tmdb_id=12
+                    )
+                    s.add(corrected)
+                    await s.flush()
+                    file = (
+                        await s.execute(
+                            select(LibraryFile).where(LibraryFile.media_item_id == media.id)
+                        )
+                    ).scalar_one()
+                    file.review_suggestion = {"media_item_id": corrected.id, "title": "Corrected"}
+                    s.add(file)
+                    await s.commit()
+                    file_id, corrected_id = file.id, corrected.id
+                r = await web.post(
+                    "/api/v1/libraries/identification/review-decisions",
+                    json={"file_ids": [file_id], "decision": "accept_suggestion"},
+                )
+                assert r.status_code == 200, r.text
+                from movieclaw_api.services.media_scrape import cleanup_orphan_items
+                from sqlalchemy import delete
+
+                async with get_database().session() as s:
+                    await s.execute(
+                        delete(PlaybackState).where(PlaybackState.media_item_id == media.id)
+                    )
+                    await s.commit()
+                assert await cleanup_orphan_items([media.id]) == 1
+                async with get_database().session() as s:
+                    facts = list((await s.execute(select(WatchRecord))).scalars())
+                    assert len(facts) == 3 and all(w.media_item_id == corrected_id for w in facts)
+
+                # Corrected identity exports the same three dates under the corrected external ID.
+                corrected_export = await call("", "POST", {"direction": "export"})
+                for _ in range(10):
+                    corrected_export = await call(f"/{corrected_export['id']}/tick", "POST")
+                    if corrected_export["state"] == "ready":
+                        break
+                assert corrected_export["total"] == 3
+                await call(
+                    f"/{corrected_export['id']}/confirm",
+                    "POST",
+                    {"token": corrected_export["preview_token"]},
+                )
+                for _ in range(10):
+                    corrected_export = await call(f"/{corrected_export['id']}/tick", "POST")
+                    if corrected_export["state"] == "complete":
+                        break
+                assert corrected_export["done"] == 3
+                posted = [
+                    json.loads(r.content)["movies"][0] for r in requests if r.method == "POST"
+                ]
+                assert len(posted) == 3 and all(r["ids"]["tmdb"] == 12 for r in posted)
+                assert {r["watched_at"][:10] for r in posted} == {
+                    "2020-01-01",
+                    "2020-01-02",
+                    "2020-01-03",
+                }
             await h.unmount(fiber)
             import asyncio
 
