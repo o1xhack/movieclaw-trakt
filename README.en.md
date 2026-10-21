@@ -8,7 +8,7 @@ Automatically track movies and episodes you watch in MovieClaw on your own Trakt
 
 ## 0.3.0 in development (not released)
 
-Adds default-off member-scoped switches for manual watched/unwatched actions and Watchlist additions, plus activity filters. Bidirectional watch-history transfers follow scan → full preview → Confirm → foreground batches, with a separate History page and persistent receipts. **History requires the companion upstream catalog/import APIs; stock v0.41.0 does not support it.** No new port or automatic bulk worker. Administrator-managed bindings only; member self-service remains in Backlog. See [scope and verification](docs/sync-workflow.zh-CN.md). This development version is neither released nor deployed; downloads below are v0.2.1.
+Adds default-off member-scoped switches for manual watched/unwatched actions and Watchlist additions, plus activity filters. Bidirectional watch-history transfers follow scan → full preview → Confirm → foreground batches, with a separate History page and persistent receipts. **Installing this development package requires the companion upstream catalog/import APIs; stock v0.41.0 cannot install it.** No new port or automatic bulk worker. Administrator-managed bindings only; member self-service remains in Backlog. See [scope and verification](docs/sync-workflow.zh-CN.md). This development version is neither released nor deployed; downloads below are v0.2.1.
 
 ## Which MovieClaw version do I need?
 
