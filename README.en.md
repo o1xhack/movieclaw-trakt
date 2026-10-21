@@ -6,6 +6,10 @@ Automatically track movies and episodes you watch in MovieClaw on your own Trakt
 
 **[Download plugin v0.2.1 (beta)](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.2.1/trakt-sync-0.2.1.mcplugin)** · [Release notes and downloads](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.2.1)
 
+## 0.3.0 in development (not released)
+
+Adds default-off member-scoped switches for manual watched/unwatched actions and Watchlist additions, plus activity filters. Bidirectional watch-history transfers follow scan → full preview → Confirm → foreground batches, with a separate History page and persistent receipts. **History requires the companion upstream catalog/import APIs; stock v0.41.0 does not support it.** No new port or automatic bulk worker. Administrator-managed bindings only; member self-service remains in Backlog. See [scope and verification](docs/sync-workflow.zh-CN.md). This development version is neither released nor deployed; downloads below are v0.2.1.
+
 ## Which MovieClaw version do I need?
 
 | Use case | MovieClaw requirement |
@@ -32,7 +36,7 @@ You need MovieClaw administrator access, a Trakt account, and a server that can 
 
 Only clients that **report playback to MovieClaw** are tracked. Infuse playing independently through Plex does not pass through this plugin. Immediate pause reporting depends on MovieClaw's event support; currently stopping is mainly reported when you leave the player.
 
-The plugin does not import past history, sync collections or ratings, or write Trakt progress back to MovieClaw.
+The features above describe released v0.2.1; development history and Watchlist sync are described separately above. Personal ratings and two-way playback progress are not provided.
 
 ## Installation
 

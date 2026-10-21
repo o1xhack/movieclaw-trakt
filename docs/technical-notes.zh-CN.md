@@ -1,3 +1,5 @@
+> 本页说明已发布的 v0.2.1。开发中的 v0.3.0 新开关与配套上游历史同步接口见[新版说明](sync-workflow.zh-CN.md)。
+
 # 默认应用与高级配置
 
 [返回安装说明](../README.md) · [English](technical-notes.en.md)

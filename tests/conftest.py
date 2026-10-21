@@ -72,7 +72,7 @@ async def harness():
                     result = await result
                 if result is not None:
                     return result
-            if request.url.path.startswith("/sync/history/"):
+            if request.method == "GET" and request.url.path.startswith("/sync/history/"):
                 return httpx.Response(200, json=[])
             return httpx.Response(201, json={"action": "scrobble"})
 

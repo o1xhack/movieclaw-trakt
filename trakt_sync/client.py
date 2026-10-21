@@ -16,6 +16,17 @@ class TraktError(Exception):
         super().__init__(f"Trakt 请求未完成（HTTP {status}）")
 
 
+class Page(list):
+    """保留官方分页头；未返回头时由调用方继续取到空页。"""
+
+    def __init__(self, values, headers):
+        super().__init__(values)
+        try:
+            self.page_count = int(headers.get("X-Pagination-Page-Count", "0"))
+        except (ValueError, TypeError):
+            self.page_count = 0
+
+
 class TraktClient:
     def __init__(self, client_id: str, client_secret: str, http: httpx.AsyncClient):
         self.client_id = client_id
@@ -26,7 +37,7 @@ class TraktClient:
         headers = {
             "trakt-api-version": "2",
             "trakt-api-key": self.client_id,
-            "User-Agent": "MovieClaw-Trakt/0.2.1",
+            "User-Agent": "MovieClaw-Trakt/0.3.0",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -47,7 +58,8 @@ class TraktClient:
                 uncertain=method == "POST" and response.status_code >= 500,
             )
         try:
-            return response.json() if response.content else {}
+            result = response.json() if response.content else {}
+            return Page(result, response.headers) if isinstance(result, list) else result
         except ValueError:
             raise TraktError(502, uncertain=method == "POST") from None
 

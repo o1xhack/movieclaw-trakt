@@ -1,6 +1,6 @@
 [project]
 name = "movieclaw-trakt"
-version = "0.2.1"
+version = "0.3.0"
 requires-python = ">=3.11"
 description = "A self-hosted Trakt playback tracking plugin for MovieClaw"
 license = "MIT"

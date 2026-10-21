@@ -1,3 +1,5 @@
+> This page describes released v0.2.1. See the [0.3.0 development workflow](sync-workflow.zh-CN.md) for opt-in switches and companion upstream history APIs.
+
 # Default application and advanced configuration
 
 [Back to installation](../README.en.md) · [中文](technical-notes.zh-CN.md)

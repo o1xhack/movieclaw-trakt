@@ -40,10 +40,22 @@ def fallback(job):
         "kind": "tv" if "show" in item else "movie",
         "season": unit.get("season"),
         "episode": unit.get("number"),
+        "category": "watched"
+        if job.get("path") == "/sync/history"
+        or (job.get("path") == "/scrobble/stop" and job.get("body", {}).get("progress", 0) > 80)
+        else "playback",
         "event": "completed"
         if job.get("path") == "/sync/history"
         else ("started" if job.get("path") == "/scrobble/start" else "stopped"),
     }
+
+
+def category(row):
+    if row.get("category") in {"watched", "favorite", "playback"}:
+        return row["category"]
+    if row.get("event") in {"marked_played", "marked_unplayed", "completed"}:
+        return "watched"
+    return "favorite" if row.get("event") == "favorited" else "playback"
 
 
 class ActivityLog:
@@ -54,9 +66,13 @@ class ActivityLog:
             previous = next((r for r in rows if r["id"] == event_id), {})
             row = {**previous, "id": event_id, **values}
             rows = [r for r in rows if r["id"] != event_id] + [row]
-            rows = rows[-80:]
+            important = {r["id"] for r in rows if category(r) != "playback"}
+            keep = {r["id"] for r in [r for r in rows if r["id"] in important][-60:]}
+            keep.update(r["id"] for r in [r for r in rows if r["id"] not in important][-20:])
+            rows = [r for r in rows if r["id"] in keep]
             while len(json.dumps(rows, ensure_ascii=False).encode()) > 48000:
-                rows.pop(0)
+                noise = next((i for i, r in enumerate(rows) if category(r) == "playback"), 0)
+                rows.pop(noise)
             await self.set(member, "activity", rows)
         except Exception:
             self.log.warning("Trakt 发送详情暂未保存，投递队列不受影响")
@@ -119,6 +135,34 @@ class ActivityLog:
                         "can_retry": state == "failed",
                     }
                 )
+        tasks = (await self.store.scopes("task", entity="transfer")).values()
+        for task in tasks:
+            if task["member_id"] != member or task["direction"] != "auto" or not task.get("title"):
+                continue
+            if task["state"] not in {"complete", "cancelled"}:
+                live.append(
+                    {
+                        "id": task["id"],
+                        "title": task["title"],
+                        "event": task["event"],
+                        "kind": "movie" if not task["episodes"] else "tv",
+                        "state": (
+                            "failed"
+                            if task["state"] == "complete_with_errors"
+                            else "blocked"
+                            if task["state"] == "paused"
+                            else "retrying"
+                            if task.get("error")
+                            else "queued"
+                        ),
+                        "occurred_at": task["created_at"],
+                        "reason": task.get("error"),
+                        "can_retry": task["state"] in {"complete_with_errors", "paused"},
+                        "transfer": True,
+                    }
+                )
+            else:
+                by_id.setdefault(task["id"], {})
         live_ids = {row["id"] for row in live}
         finished = [
             row

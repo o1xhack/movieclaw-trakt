@@ -20,8 +20,29 @@ jobs:
       - run: python -m pytest -q
         env:
           PYTHONPATH: .sdk/src
+      - run: node --test tests/web.test.cjs
+      - run: node --check web/app.js
+      - run: node --check web/history.js
       - run: python scripts/package.py
       - uses: actions/upload-artifact@v4
         with:
           name: trakt-sync
           path: dist/*
+  matched-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: o1xhack/movieclaw
+          ref: 3e9c15dff5a59105f1f69e1afa3af617a7f43968 # companion history API proposal
+          path: .sdk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt -e .sdk
+      - run: bash .sdk/scripts/export-spec.sh
+      - run: python -m pytest tests/test_history_integration.py tests/test_host_contract.py -q
+        env:
+          PYTHONPATH: .sdk/src
+          MOVIECLAW_HOST_QA: '1'

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — Unreleased / 未发布
+
+- 三个独立、默认关闭的成员偏好：手动已看、取消已看、收藏加入 Watchlist。仅管理员管理，成员自助设置留 Backlog，不提供个人评分。
+- 实时事件分块落盘、失败重试、按成员和账号隔离，后续操作不越过较早失败任务。
+- 活动类型与发送状态组合筛选，默认观看与收藏；播放噪声有独立保留限额。
+- 历史双向同步依赖配套上游新 catalog/import API：手动扫描、电影／每季分组全量预览、Confirm、前台进度、回执和独立 History 明细。关闭网页不继续下一批，不提供后台批量执行。
+- 原时间、重看、源记录幂等与状态版本冲突保护；分页、Retry-After、响应丢失去重和增量回执。缺少 API 或授权时暂停，不伪造成功。
+- Companion host/plugin integration and 30k-history/400-local-unit tests use mocked Trakt only. Not released or deployed; stock v0.41.0 cannot run the new history feature.
+
 ## 0.2.1
 
 - 账号与同步活动面板采用 MovieClaw 活动页的宽栏、分组列表及主题变量。

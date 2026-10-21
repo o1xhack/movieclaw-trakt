@@ -40,6 +40,28 @@ class Engine(ActivityLog):
     async def status(self, member):
         account = await self.get(member, "account", {})
         ledger = await self.ledger(member)
+        tasks = [
+            t
+            for t in (await self.store.scopes("task", entity="transfer")).values()
+            if t["member_id"] == member and t["direction"] == "auto"
+        ]
+        pending_auto = sum(
+            max(0, t["total"] - t["done"] - t["failed"] - t["skipped"])
+            for t in tasks
+            if t["state"] in {"running", "paused"}
+        )
+        failed_auto = sum(t["failed"] for t in tasks if t["state"] == "complete_with_errors")
+        auto_success = [
+            t.get("completed_at")
+            for t in tasks
+            if t["state"] in {"complete", "complete_with_errors"} and t["done"]
+        ]
+        last_success = max(
+            [value for value in [ledger.get("last_success"), *auto_success] if value], default=None
+        )
+        auto_errors = [
+            t.get("error") for t in tasks if t["state"] in {"running", "paused"} and t.get("error")
+        ]
         return {
             "enabled": self.enabled,
             "configured": bool(self.client.client_id),
@@ -47,10 +69,15 @@ class Engine(ActivityLog):
             "connected": bool(account.get("access_token"))
             and account.get("client_id") == self.client.client_id,
             "username": account.get("username"),
-            "pending": len(ledger["queue"]),
-            "failed": len(ledger.get("failed", [])),
-            "last_success": ledger.get("last_success"),
-            "last_error": ledger.get("last_error"),
+            "pending": len(ledger["queue"]) + pending_auto,
+            "failed": len(ledger.get("failed", [])) + failed_auto,
+            "last_success": last_success,
+            "last_error": ledger.get("last_error")
+            or (
+                auto_errors[0]
+                if auto_errors
+                else ("有手动同步失败记录，请重试" if failed_auto else None)
+            ),
             "member_id": member,
         }
 
@@ -128,6 +155,10 @@ class Engine(ActivityLog):
             for key in ("account", "pending", "ledger", "activity"):
                 await self.store.delete(key, scope=self.scope(member))
             self.rotated.pop(member, None)
+            for scope, task in (await self.store.scopes("task", entity="transfer")).items():
+                if task["member_id"] == member and task["state"] not in {"complete", "cancelled"}:
+                    task.update(state="cancelled", error="账号已断开，保留任务历史")
+                    await self.store.set("task", task, scope=scope)
             revoked = True
             if account.get("access_token"):
                 try:
@@ -238,6 +269,9 @@ class Engine(ActivityLog):
                     member,
                     event_id,
                     **describe(event, kind),
+                    category="watched"
+                    if completed or (kind == "stopped" and rate is not None and rate > 80)
+                    else "playback",
                     occurred_at=occurred_at,
                     state="queued" if request else "skipped",
                     reason=None if request else "缺少有效的外部编号，未发送到 Trakt",
@@ -272,19 +306,31 @@ class Engine(ActivityLog):
     async def history_exists(self, member, account, job):
         when = timestamp(job["occurred_at"])
         kind = "movies" if "movie" in job["item"] else "episodes"
-        rows = await self.authorized(
-            member,
-            account,
-            "GET",
-            f"/sync/history/{kind}",
-            params={"start_at": iso_time(when - 90), "end_at": iso_time(when + 90), "limit": 100},
-        )
-        for row in rows:
-            if not matches(job["item"], row):
-                continue
-            if abs(timestamp(row["watched_at"]) - when) <= 60:
-                return True
-        return False
+        page = 1
+        previous = None
+        while True:
+            rows = await self.authorized(
+                member,
+                account,
+                "GET",
+                f"/sync/history/{kind}",
+                params={
+                    "start_at": iso_time(when - 90),
+                    "end_at": iso_time(when + 90),
+                    "limit": 100,
+                    "page": page,
+                },
+            )
+            for row in rows:
+                if matches(job["item"], row) and abs(timestamp(row["watched_at"]) - when) <= 60:
+                    return True
+            if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
+                return False
+            signature = json.dumps(rows, sort_keys=True)
+            if signature == previous:
+                raise TraktError(502)
+            previous = signature
+            page += 1
 
     async def drain(self, member):
         async with self.locks[member]:
