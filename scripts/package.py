@@ -12,7 +12,16 @@ ROOT = Path(__file__).resolve().parents[1]
 def build(output):
     version = tomllib.loads((ROOT / "movieclaw-plugin.toml").read_text())["plugin"]["version"]
     files = [
-        ROOT / name for name in ("movieclaw-plugin.toml", "README.md", "LICENSE", "PRIVACY.md")
+        ROOT / name
+        for name in (
+            "movieclaw-plugin.toml",
+            "README.md",
+            "README.en.md",
+            "docs/technical-notes.zh-CN.md",
+            "docs/technical-notes.en.md",
+            "LICENSE",
+            "PRIVACY.md",
+        )
     ]
     files += sorted((ROOT / "trakt_sync").glob("*.py"))
     files += sorted(p for p in (ROOT / "web").iterdir() if p.is_file())

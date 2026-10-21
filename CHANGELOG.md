@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4
+
+- 默认中文 README，新增完整英文版，明确宿主版本要求、功能和网页安装流程。
+- 添加插件包直接下载入口，将开发、权限和队列细节移入中英文技术说明。
+- 插件包包含中英文文档；播放同步逻辑与 0.1.3 相同。
+- Chinese-first README with a full English version, explicit compatibility, features, and web installation steps.
+- Direct plugin download links and separate technical notes in both languages, bundled with the plugin.
+- Playback behavior is unchanged from 0.1.3.
+
 ## 0.1.3
 
 - Honor explicit completion events even when MovieClaw resets the resume position to zero.
