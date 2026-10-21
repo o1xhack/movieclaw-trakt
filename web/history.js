@@ -1,6 +1,6 @@
 "use strict";
 const $ = id => document.getElementById(id);
-const labels = {scanning:"正在扫描", ready:"等待核对确认", running:"正在写入", paused:"已暂停", complete:"全部完成", complete_with_errors:"有条目未同步", cancelled:"已取消"};
+const labels = {scanning:"扫描阶段", ready:"等待核对确认", running:"写入阶段", paused:"已暂停", complete:"全部完成", complete_with_errors:"有条目未同步", cancelled:"已取消"};
 const active = t => t && ["scanning", "running"].includes(t.state);
 let member = Number(new URL(location.href).searchParams.get("member_id") || 0);
 if (!Number.isSafeInteger(member) || member < 0) member = 0;
@@ -11,7 +11,7 @@ function el(tag, text) { const n = document.createElement(tag); if (text != null
 function date(t) { return new Date(t).toLocaleString(); }
 function counts(t) { return `${t.movies || 0} 部电影，${t.shows || 0} 部剧集 / ${t.seasons || 0} 季 / ${t.episodes || 0} 集，共 ${t.total} 条观看记录（含重看）`; }
 function description(t) {
-  if (t.state === "complete") return `已将 ${date(t.cutoff)} 之前本次匹配且未同步的 ${t.done} 条记录全部同步。库外或缺少匹配编号的条目未导入。`;
+  if (t.state === "complete") return `已将 ${date(t.cutoff)} 之前本次匹配且未同步的 ${t.done} 条记录全部同步。库外或缺少匹配编号的条目未同步。`;
   return `${labels[t.state] || t.state} · 已完成 ${t.done} · 失败 ${t.failed} · 跳过 ${t.skipped} · 未匹配 ${t.unmatched}`;
 }
 async function api(path, method = "GET", body) {
@@ -28,7 +28,8 @@ function render() {
   $("current-section").hidden = !task;
   $("export").disabled = $("import").disabled = !!(task && !["complete", "complete_with_errors", "cancelled"].includes(task.state));
   if (!task) return;
-  $("current-title").textContent = `${task.direction === "export" ? "MovieClaw → Trakt" : "Trakt → MovieClaw"} · ${labels[task.state]}`;
+  const phase = active(task) ? (driving ? (task.state === "scanning" ? "正在扫描" : "正在写入") : "等待在此页继续") : labels[task.state];
+  $("current-title").textContent = `${task.direction === "export" ? "MovieClaw → Trakt" : "Trakt → MovieClaw"} · ${phase}`;
   $("progress-text").textContent = task.state === "scanning" ? `已检查 ${task.scanned} 个单元 / 历史记录；待同步 ${task.total} 条，未匹配 ${task.unmatched}` : `${counts(task)}。${description(task)}`;
   $("task-error").textContent = task.error || "";
   $("keep-open").hidden = ["complete", "complete_with_errors", "cancelled", "ready"].includes(task.state);
