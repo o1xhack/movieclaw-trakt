@@ -104,6 +104,8 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
         ) as web:
             initial = (await web.get(prefix + "/status")).json()
             assert initial["configured"] and not initial["connected"]
+            assert (await web.get(prefix + "/accounts")).json()["accounts"][0]["member_id"] == 0
+            assert (await web.get(prefix + "/activity")).json()["records"] == []
             assert (await web.post(prefix + "/auth/begin")).status_code == 200
             assert (await web.post(prefix + "/auth/poll")).json()["state"] == "connected"
             payload = Playback.model_validate(
@@ -122,6 +124,11 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
             await engines[0].drain(0)
             status = (await web.get(prefix + "/status")).json()
             assert status["connected"] and status["pending"] == 0
+            activity = (await web.get(prefix + "/activity")).json()
+            assert activity["records"][0]["state"] == "sent"
+            assert activity["records"][0]["title"] == "Fixture"
+            assert "fixture-a" not in json.dumps(activity)
+            assert (await web.post(prefix + "/retry/missing")).status_code == 409
             assert (await store.get("account", scope="member:0"))["client_id"] == expected_id
             assert "fixture-a" not in json.dumps(status)
             assert [r.url.path for r in requests].count("/scrobble/stop") == 1

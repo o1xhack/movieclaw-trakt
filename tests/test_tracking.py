@@ -316,6 +316,8 @@ async def test_seek_near_end_start_is_never_converted_to_watched_history(harness
     await e.drain(0)
     assert requests == []
     assert not (await e.status(0))["pending"]
+    assert not (await e.status(0))["last_success"]
+    assert (await e.activity(0))["records"][0]["state"] == "skipped"
 
 
 async def test_short_stop_422_is_expected_noop_not_matching_failure(harness, event):

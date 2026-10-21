@@ -56,7 +56,7 @@ shasum -a 256 -c SHA256SUMS
 Most users should follow the web steps in the [README](../README.en.md). Administrators with `mclaw` configured can also upload using:
 
 ```sh
-mclaw app plugins packages upload --file trakt-sync-0.1.5.mcplugin
+mclaw app plugins packages upload --file trakt-sync-0.2.1.mcplugin
 ```
 
 Then review permissions and approve installation on the MovieClaw plugin page.
@@ -75,3 +75,11 @@ PYTHONPATH="$MOVIECLAW_SOURCE/src" .venv/bin/python -m pytest -q
 ```
 
 Packaging uses an allowlist and includes both documentation languages. Local settings, credentials, virtual environments, and test data are excluded. Only the dedicated plugin application's public Client ID is bundled; there is no Client Secret, user token, or private deployment configuration. Automated tests use fictional credentials and mocked Trakt responses without adding records to a real watch history.
+
+## Accounts and delivery activity
+
+The account list contains connected plugin members and the administrator entry. Advanced settings allow connecting another member by ID without requesting directory permissions.
+
+Each member has up to 80 recent display records within a separate 48 KB value; display storage errors do not block reliable delivery. Legacy queues fall back to external IDs when titles are unavailable. Previously sent events are not backfilled. Sent means Trakt accepted or confirmed a request, not that every event created a completed watch. Short-play stops are labeled separately.
+
+Details omit response bodies, credentials, file paths and device names. Matching failures (404 / 422) can be retried individually or together. Network/rate-limit retries retain the existing schedule; authorization failures ask for reconnection. The UI does not bypass Retry-After.

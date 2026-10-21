@@ -6,11 +6,12 @@ import time
 import uuid
 from collections import defaultdict
 
+from .activity import ActivityLog, describe
 from .client import TraktError
 from .policy import history_body, identity, iso_time, matches, progress, session_key, timestamp
 
 
-class Engine:
+class Engine(ActivityLog):
     def __init__(self, store, client, health, logger, *, enabled=True, clock=time.time):
         self.store, self.client, self.health, self.log = store, client, health, logger
         self.enabled, self.clock = enabled, clock
@@ -42,6 +43,7 @@ class Engine:
         return {
             "enabled": self.enabled,
             "configured": bool(self.client.client_id),
+            "has_account": bool(account.get("access_token")),
             "connected": bool(account.get("access_token"))
             and account.get("client_id") == self.client.client_id,
             "username": account.get("username"),
@@ -123,7 +125,7 @@ class Engine:
         async with self.locks[member]:
             account = await self.get(member, "account", {})
             # 先撤销本地状态，之后的事件和排队任务均不能再使用这个账号。
-            for key in ("account", "pending", "ledger"):
+            for key in ("account", "pending", "ledger", "activity"):
                 await self.store.delete(key, scope=self.scope(member))
             self.rotated.pop(member, None)
             revoked = True
@@ -230,6 +232,16 @@ class Engine:
             )
             ledger["seen"] = [*ledger["seen"], event_id][-256:]
             await self.save_ledger(member, ledger)
+
+            if request or (not item and kind != "progress"):
+                await self.record_activity(
+                    member,
+                    event_id,
+                    **describe(event, kind),
+                    occurred_at=occurred_at,
+                    state="queued" if request else "skipped",
+                    reason=None if request else "缺少有效的外部编号，未发送到 Trakt",
+                )
 
     async def authorized(self, member, account, method, path, body=None, params=None):
         # 一次投递可能先查历史再写入；前一步可能已经轮换了单次刷新令牌。
@@ -338,6 +350,7 @@ class Engine:
                         if any(result["not_found"].values()):
                             raise TraktError(404)
             except TraktError as exc:
+                job["error_status"] = exc.status
                 if (
                     exc.status == 422
                     and job["path"] in ("/scrobble/stop", "/scrobble/pause")
@@ -374,26 +387,38 @@ class Engine:
             ledger["queue"].pop(0)
             if job["path"] != "/scrobble/start" and ledger.get("watching") == job["key"]:
                 ledger.pop("watching", None)
-            ledger["last_success"] = iso_time(self.clock())
+            if result.get("action") != "expired":
+                ledger["last_success"] = iso_time(self.clock())
             ledger["last_error"] = (
                 "有影片无法在 Trakt 匹配，请检查外部编号后重试" if ledger.get("failed") else None
             )
             await self.save_ledger(member, ledger)
+            await self.complete_activity(member, job, result.get("action"))
             if ledger["last_error"]:
                 await self.health.degraded(f"member-{member}", ledger["last_error"])
             else:
                 await self.health.ok(f"member-{member}")
 
-    async def retry_failed(self, member):
+    async def retry_failed(self, member, delivery_id=None):
         async with self.locks[member]:
             ledger = await self.ledger(member)
-            failed = ledger.get("failed", [])
+            failed = [
+                job
+                for job in ledger.get("failed", [])
+                if delivery_id is None or job["id"] == delivery_id
+            ]
+            if delivery_id is not None and not failed:
+                raise ValueError("这条失败记录已处理或不存在，请刷新页面")
             if len(ledger["queue"]) + len(failed) > 64:
                 raise ValueError("请先等待现有队列同步完成")
             for job in failed:
                 job["next_at"] = self.clock()
+                job.pop("error_status", None)
             ledger["queue"].extend(failed)
-            ledger["failed"] = []
+            selected = {job["id"] for job in failed}
+            ledger["failed"] = [
+                job for job in ledger.get("failed", []) if job["id"] not in selected
+            ]
             await self.save_ledger(member, ledger)
             return {"retried": len(failed)}
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- 账号与同步活动面板采用 MovieClaw 活动页的宽栏、分组列表及主题变量。
+- 每个账号显示连接状态、待发送/失败数量与上次发送时间，成员 ID 与自定义应用收进高级设置。
+- 新增有限发送记录：影片、季集、观看/发送时间、具体 HTTP 错误、自动重试时间及单条失败重试。
+- 近期记录每成员最多 80 条，独立于可靠队列；兼容旧队列，无标题时显示外部编号。
+- Theme-aware account/activity dashboard, per-member delivery details, safe error messages and selective retry.
+- Bounded local activity log (up to 80 records per member), separate from the reliable queue; existing bindings retained.
+
 ## 0.1.5
 
 - 内置独立的 MovieClaw Trakt 公开应用，安装后直接登录授权，无需申请或填写 Client ID。

@@ -4,7 +4,7 @@
 
 Automatically track movies and episodes you watch in MovieClaw on your own Trakt account. Install the plugin on your MovieClaw server; no separate plugin installation is needed on your phone or TV.
 
-**[Download plugin v0.1.5 (beta)](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.5/trakt-sync-0.1.5.mcplugin)** · [Release notes and downloads](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.1.5)
+**[Download plugin v0.2.1 (beta)](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.2.1/trakt-sync-0.2.1.mcplugin)** · [Release notes and downloads](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.2.1)
 
 ## Which MovieClaw version do I need?
 
@@ -19,6 +19,9 @@ You need MovieClaw administrator access, a Trakt account, and a server that can 
 > This is a beta. The offline path has been checked in source and isolated integration tests, but a complete real-iPhone airplane-mode/playback/reconnection test is still pending. From v0.1.5, install the plugin, click Connect Trakt, and authorize your account.
 
 ## Features
+
+- **Account dashboard:** Connection state, pending/failed counts, and last delivery time for each account.
+- **Delivery details:** Titles, episodes, outcomes, errors, filters, and single-record retries. Advanced configuration is collapsed by default.
 
 - **Now watching:** Show the current movie or episode on Trakt when online playback starts or resumes.
 - **Automatic watch history:** Report progress and completion so Trakt can record watches under its rules. Autoplaying the next episode is not required.
@@ -35,7 +38,7 @@ The plugin does not import past history, sync collections or ratings, or write T
 
 ### 1. Download the plugin
 
-Click **[Download trakt-sync-0.1.5.mcplugin](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.5/trakt-sync-0.1.5.mcplugin)** and save it to your computer.
+Click **[Download trakt-sync-0.2.1.mcplugin](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.2.1/trakt-sync-0.2.1.mcplugin)** and save it to your computer.
 
 Keep the `.mcplugin` file as downloaded. **Do not extract it or download GitHub's Source code archives.** No terminal commands or Python installation are needed.
 
@@ -52,11 +55,11 @@ The plugin needs playback events, network access to Trakt, and storage for autho
 ### 3. Sign in and authorize Trakt
 
 1. Open **Trakt** in the MovieClaw web sidebar.
-2. For the administrator's own account, keep the default **member ID `0`**.
-3. Click **连接 Trakt** (Connect Trakt), open the provided Trakt authorization link, enter the displayed code, and approve access.
+2. Click **连接 Trakt** (Connect Trakt) on the account card.
+3.  open the provided Trakt authorization link, enter the displayed code, and approve access.
 4. Return to MovieClaw and wait for **已连接** (Connected).
 
-For another family member, the administrator selects that member's MovieClaw ID and lets them authorize their own Trakt account. Connect each member separately.
+For another family member, open **高级设置** (Advanced), enter their MovieClaw member ID (administrator = `0`), check their status, and connect their own Trakt account. Connect each member separately.
 
 **You're ready.** Play a recognized title as the connected MovieClaw member and check Trakt's “now watching.” The server only needs outbound HTTPS to Trakt: no public inbound port or VPN is required for the plugin. There is no second Trakt login on the phone.
 
@@ -65,7 +68,7 @@ For another family member, the administrator selects that member's MovieClaw ID 
 | Question | What to do |
 | --- | --- |
 | How do I update? | Download the new `.mcplugin`, upload it through the same plugin screen, and approve the update. Updates with the same plugin ID retain connections and plugin data |
-| Nothing is syncing? | Check the Trakt connection, the MovieClaw member playing the title, pending requests, and any error shown on the Trakt page |
+| Nothing is syncing? | Select the account and inspect the title and reason under Sync Activity; expand a matching failure to retry that record |
 | Why didn't offline viewing upload immediately? | Run the app again and reconnect to MovieClaw. A force-quit app cannot guarantee automatic uploads. Full support also requires the server fix above |
 | Why is a title skipped? | It needs recognizable external IDs such as TMDB / IMDb; the plugin does not guess from titles |
 | How do I disconnect? | Click Disconnect on the Trakt page. Existing Trakt watch history is retained |

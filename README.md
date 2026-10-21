@@ -4,7 +4,7 @@
 
 在 MovieClaw 看电影、追剧，自动同步到你自己的 Trakt 账号。插件装在 MovieClaw 服务器上，手机和电视无需另外安装插件。
 
-**[下载插件 v0.1.5（测试版）](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.5/trakt-sync-0.1.5.mcplugin)** · [版本说明与所有下载](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.1.5)
+**[下载插件 v0.2.1（测试版）](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.2.1/trakt-sync-0.2.1.mcplugin)** · [版本说明与所有下载](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.2.1)
 
 ## 需要什么版本？
 
@@ -19,6 +19,9 @@
 > 当前是测试版。离线链路已完成代码检查和隔离联调，真实 iPhone 飞行模式播放、恢复联网的完整测试尚未完成。v0.1.5 起，安装后直接连接 Trakt、登录授权即可使用。
 
 ## 能做什么？
+
+- **账号与同步面板**：每个账号显示连接状态、待发送与失败数量、上次发送时间。
+- **具体发送记录**：查看影片、季集、发送结果与失败原因，按状态筛选并单条重试。高级配置默认折叠。
 
 - **正在观看**：开始或恢复联网播放后，让 Trakt 显示正在看的电影或剧集。
 - **自动记录已看**：上报观看进度与结束状态，由 Trakt 按其规则记录观看历史；不需要先自动播放下一集。
@@ -35,7 +38,7 @@
 
 ### 1. 下载插件包
 
-点击 **[下载 trakt-sync-0.1.5.mcplugin](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.5/trakt-sync-0.1.5.mcplugin)**，保存到电脑。
+点击 **[下载 trakt-sync-0.2.1.mcplugin](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.2.1/trakt-sync-0.2.1.mcplugin)**，保存到电脑。
 
 文件保持 `.mcplugin` 格式，**不用解压，也不用下载 GitHub 的 Source code**。不需要运行命令或安装 Python。
 
@@ -52,11 +55,11 @@
 ### 3. 登录并授权 Trakt
 
 1. 在 MovieClaw 网页侧边栏打开 **Trakt**。
-2. 如果只给管理员自己使用，保留默认的 **成员 ID `0`**。
-3. 点击 **连接 Trakt**，打开页面给出的 Trakt 授权链接，输入显示的授权码并确认。
+2. 在账号卡片上点击 **连接 Trakt**。
+3. 打开页面给出的 Trakt 授权链接，输入显示的授权码并确认。
 4. 回到 MovieClaw，看到 **已连接** 即可。
 
-为其他家庭成员连接时，由管理员选择对应的 MovieClaw 成员 ID，再让该成员授权自己的 Trakt 账号。每个成员都需要单独连接。
+为其他家庭成员连接时，打开 **高级设置**，填写对应的 MovieClaw 成员 ID（管理员为 `0`），点「查看状态」并连接。让该成员授权自己的 Trakt 账号，每个成员都需要单独连接。
 
 **安装完成。** 用已绑定的成员账号播放一部 MovieClaw 已识别的影片，再到 Trakt 查看“正在观看”。服务器只需要向 Trakt 发起 HTTPS 连接，不需要为插件开放公网端口，也不需要 VPN；手机端无需再次登录 Trakt。
 
@@ -65,7 +68,7 @@
 | 问题 | 处理方式 |
 | --- | --- |
 | 如何更新？ | 下载新版 `.mcplugin`，在同一个插件上传入口安装并批准更新；同 ID 更新会保留绑定和插件数据 |
-| 没有同步？ | 先检查 Trakt 页面是否已连接、当前播放成员是否正确，再看待同步数量和错误提示 |
+| 没有同步？ | 选择对应账号，在「同步活动」查看具体影片和失败原因；匹配失败可展开记录单条重试 |
 | 为什么离线记录没有立即上传？ | App 需要再次运行并连接 MovieClaw；App 被彻底关闭时不会保证自动补传。完整支持还需要上表的服务端修复 |
 | 为什么有的影片被跳过？ | 内容需要可识别的 TMDB / IMDb 等编号；插件不会仅凭标题猜测 |
 | 如何断开？ | 在 Trakt 页面点「断开连接」；Trakt 已有观看历史不会被删除 |

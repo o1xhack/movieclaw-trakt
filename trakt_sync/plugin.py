@@ -84,6 +84,16 @@ async def apply(ctx: Context):
     async def status(member_id: int = Query(0, ge=0)) -> dict:
         return await engine.status(member_id)
 
+    @router.get(
+        "/accounts", operation_id="plugins.trakt-sync.accounts", summary="查看 Trakt 账号总览"
+    )
+    async def accounts() -> dict:
+        return await engine.accounts()
+
+    @router.get("/activity", operation_id="plugins.trakt-sync.activity", summary="查看成员发送记录")
+    async def activity(member_id: int = Query(0, ge=0)) -> dict:
+        return await engine.activity(member_id)
+
     @router.post(
         "/auth/begin",
         operation_id="plugins.trakt-sync.auth.begin",
@@ -119,6 +129,17 @@ async def apply(ctx: Context):
     async def retry(member_id: int = Query(0, ge=0)) -> dict:
         try:
             return await engine.retry_failed(member_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @router.post(
+        "/retry/{delivery_id}",
+        operation_id="plugins.trakt-sync.retry-one",
+        summary="重试指定的失败记录",
+    )
+    async def retry_one(delivery_id: str, member_id: int = Query(0, ge=0)) -> dict:
+        try:
+            return await engine.retry_failed(member_id, delivery_id)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
 
