@@ -344,3 +344,144 @@ async def test_legacy_short_pause_queue_can_be_retried_without_false_alarm(harne
     await e.drain(0)
     assert (await e.status(0))["failed"] == 0
     assert (await e.status(0))["last_success"]
+
+
+@pytest.mark.parametrize("duration", [100000, None])
+async def test_explicit_completion_survives_cleared_resume_position(harness, event, duration):
+    e, _, clock, requests = await harness()
+    payload = {**event, "position_ms": 0, "duration_ms": duration, "played": True}
+    await e.accept("completed", payload, "cleared-completion", iso_time(clock[0]))
+    await e.drain(0)
+    assert json.loads(requests[-1].content)["progress"] == 100
+    assert requests[-1].url.path == "/scrobble/stop"
+
+
+async def test_cleared_stop_then_completion_is_upgraded_to_finished(harness, event):
+    e, _, clock, requests = await harness()
+    payload = {**event, "position_ms": 0, "played": True}
+    await e.accept("stopped", {**payload, "completed": False}, "stop", iso_time(clock[0]))
+    await e.accept("completed", payload, "done", iso_time(clock[0]))
+    await e.drain(0)
+    await e.drain(0)
+    assert json.loads(requests[-1].content)["progress"] == 100
+
+
+async def test_old_cleared_completion_keeps_original_episode_watch_time(harness, event):
+    e, _, clock, requests = await harness()
+    payload = {
+        **event,
+        "media": {"id": 9, "kind": "tv", "tmdb_id": 1435},
+        "unit": {"season": 1, "episode": 2},
+        "position_ms": 0,
+        "played": True,
+    }
+    when = iso_time(clock[0] - 86400)
+    await e.accept("completed", payload, "offline-done", when)
+    await e.drain(0)
+    assert [r.url.path for r in requests] == ["/sync/history/episodes", "/sync/history"]
+    body = json.loads(requests[-1].content)
+    assert body["shows"][0]["seasons"][0]["episodes"][0]["watched_at"] == when
+
+
+async def test_completed_stop_and_completion_pair_is_one_finish(harness, event):
+    e, _, clock, requests = await harness()
+    payload = {**event, "position_ms": 0, "played": True, "completed": True}
+    await e.accept("stopped", payload, "stop-complete", iso_time(clock[0]))
+    await e.accept("completed", payload, "complete", iso_time(clock[0]))
+    await e.drain(0)
+    await e.drain(0)
+    assert len(requests) == 1
+    assert json.loads(requests[0].content)["progress"] == 100
+
+
+async def test_previously_played_flag_does_not_finish_early_rewatch(harness, event):
+    e, _, clock, requests = await harness()
+    await e.accept(
+        "stopped",
+        {**event, "position_ms": 0, "played": True, "completed": False},
+        "early-rewatch",
+        iso_time(clock[0]),
+    )
+    await e.drain(0)
+    assert json.loads(requests[0].content)["progress"] == 0
+
+
+async def test_recent_local_completion_always_uses_original_time(harness, event):
+    e, _, clock, requests = await harness()
+    when = iso_time(clock[0] - 30)
+    await e.accept(
+        "completed",
+        {**event, "viewing_id": "local-offline-1", "position_ms": 0, "played": True},
+        "local-complete",
+        when,
+    )
+    await e.drain(0)
+    assert [r.url.path for r in requests] == ["/sync/history/movies", "/sync/history"]
+    assert json.loads(requests[-1].content)["movies"][0]["watched_at"] == when
+
+
+async def test_local_completion_clears_matching_watching_then_adds_history_once(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(200, json={"movie": {"ids": {"tmdb": 11}}})
+
+    e, _, clock, requests = await harness(handler)
+    payload = {**event, "viewing_id": "live-local-copy"}
+    await e.accept("started", {**payload, "position_ms": 0}, "local-start", iso_time(clock[0]))
+    await e.drain(0)
+    clock[0] += 60
+    when = iso_time(clock[0])
+    await e.accept("completed", {**payload, "position_ms": 0, "played": True}, "local-done", when)
+    await e.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/sync/history/movies",
+        "/users/me/watching",
+        "/scrobble/pause",
+        "/sync/history",
+    ]
+    assert json.loads(requests[-1].content)["movies"][0]["watched_at"] == when
+    await e.accept(
+        "stopped",
+        {**payload, "position_ms": 0, "played": True, "completed": False},
+        "local-stop",
+        when,
+    )
+    await e.drain(0)
+    assert len(requests) == 5
+
+
+async def test_local_history_never_pauses_someone_elses_watching(harness, event):
+    e, _, clock, requests = await harness()
+    await e.accept(
+        "started",
+        {**event, "media": {"id": 99, "kind": "movie", "tmdb_id": 99}},
+        "other-start",
+        iso_time(clock[0]),
+    )
+    await e.drain(0)
+    when = iso_time(clock[0] - 20)
+    await e.accept(
+        "completed",
+        {**event, "viewing_id": "old-local-watch", "position_ms": 0},
+        "local-history",
+        when,
+    )
+    await e.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/sync/history/movies",
+        "/sync/history",
+    ]
+
+
+async def test_local_rewatches_are_distinct_and_each_replay_is_idempotent(harness, event):
+    e, _, clock, requests = await harness()
+    for n in range(2):
+        payload = {**event, "viewing_id": f"viewing-{n}", "position_ms": 0, "played": True}
+        when = iso_time(clock[0] - 86400 + n * 3600)
+        for replay in range(2):
+            await e.accept("completed", payload, f"event-{n}", when)
+    await e.drain(0)
+    await e.drain(0)
+    assert [r.url.path for r in requests].count("/sync/history") == 2

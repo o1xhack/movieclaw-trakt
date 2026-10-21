@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict
 
 from .client import TraktError
-from .policy import history_body, identity, iso_time, progress, session_key, timestamp
+from .policy import history_body, identity, iso_time, matches, progress, session_key, timestamp
 
 
 class Engine:
@@ -150,6 +150,12 @@ class Engine:
             if event_id in ledger["seen"]:
                 return
             item, rate = identity(event), progress(event)
+            completed = kind == "completed" or (
+                kind == "stopped" and event.get("completed") is True
+            )
+            if completed:
+                # MovieClaw 看完后清零续播点；完成事件才是事实，不能把它算成 0%。
+                rate = 100.0
             at = timestamp(occurred_at)
             if at > self.clock() + 60:
                 return
@@ -157,17 +163,22 @@ class Engine:
             state = ledger["sessions"].get(key, {})
             stale = self.clock() - at > 300
             request = None
-            if item and stale:
+            local_completion = bool(event.get("viewing_id")) and completed
+            if item and (stale or local_completion or (completed and at < state.get("at", 0))):
                 # 离线回传不能伪装成“正在观看”，完成记录保留原观看时间。
                 if kind in ("stopped", "completed") and rate is not None and rate > 80:
                     if abs(at - state.get("terminal_at", -1000)) > 10:
                         request = {"path": "/sync/history", "body": history_body(item, occurred_at)}
+                        if local_completion:
+                            request["clear_watching"] = not stale and ledger.get("watching") == key
+                            state["closed"] = True
+                            state["at"] = at
                         state["terminal_at"] = at
             elif item and at >= state.get("at", 0):
                 if kind == "started":
                     state = {"session": event_id, "at": at, "last_start": at}
                     request = {"path": "/scrobble/start", "body": {**item, "progress": rate or 0}}
-                elif not state.get("closed"):
+                elif not state.get("closed") or (completed and "terminal_at" not in state):
                     state["at"] = at
                     if kind in ("stopped", "completed") and rate is not None:
                         state["closed"] = True
@@ -187,6 +198,7 @@ class Engine:
             if request:
                 # 同一播放尚未发出的心跳只保留最新一条；停止事件不会被它覆盖。
                 if request["path"] == "/scrobble/start":
+                    ledger["watching"] = key
                     ledger["queue"] = [
                         j
                         for j in ledger["queue"]
@@ -255,15 +267,8 @@ class Engine:
             f"/sync/history/{kind}",
             params={"start_at": iso_time(when - 90), "end_at": iso_time(when + 90), "limit": 100},
         )
-        target = job["item"].get("movie", job["item"].get("show"))
         for row in rows:
-            actual = row.get("movie", row.get("show", {}))
-            if not any(actual.get("ids", {}).get(k) == value for k, value in target["ids"].items()):
-                continue
-            if "episode" in job["item"] and any(
-                row.get("episode", {}).get(k) != value
-                for k, value in job["item"]["episode"].items()
-            ):
+            if not matches(job["item"], row):
                 continue
             if abs(timestamp(row["watched_at"]) - when) <= 60:
                 return True
@@ -297,10 +302,27 @@ class Engine:
                     if finished:
                         job["uncertain"] = True
                         await self.save_ledger(member, ledger)
-                    if finished and (uncertain or late):
+                    if finished and (job["path"] == "/sync/history" or uncertain or late):
                         if await self.history_exists(member, account, job):
                             result = {"action": "already_synced"}
                         else:
+                            if (
+                                job.get("clear_watching")
+                                and not late
+                                and ledger.get("watching") == job["key"]
+                            ):
+                                watching = await self.authorized(
+                                    member, account, "GET", "/users/me/watching"
+                                )
+                                if matches(job["item"], watching):
+                                    # pause 不生成已看历史；再用原观看时间写唯一一条历史。
+                                    await self.authorized(
+                                        member,
+                                        account,
+                                        "POST",
+                                        "/scrobble/pause",
+                                        {**job["item"], "progress": 100},
+                                    )
                             result = await self.authorized(
                                 member,
                                 account,
@@ -350,6 +372,8 @@ class Engine:
                     await self.health.degraded(f"member-{member}", str(exc))
                     return
             ledger["queue"].pop(0)
+            if job["path"] != "/scrobble/start" and ledger.get("watching") == job["key"]:
+                ledger.pop("watching", None)
             ledger["last_success"] = iso_time(self.clock())
             ledger["last_error"] = (
                 "有影片无法在 Trakt 匹配，请检查外部编号后重试" if ledger.get("failed") else None

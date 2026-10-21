@@ -47,7 +47,19 @@ def session_key(event: dict) -> str:
         event.get("unit"),
         (event.get("client") or {}).get("device_id"),
     ]
+    if event.get("viewing_id"):
+        fields.append(event["viewing_id"])
     return hashlib.sha256(repr(fields).encode()).hexdigest()[:24]
+
+
+def matches(item: dict, row: dict) -> bool:
+    target = item.get("movie", item.get("show", {}))
+    actual = row.get("movie", row.get("show", {}))
+    if not any(actual.get("ids", {}).get(k) == value for k, value in target.get("ids", {}).items()):
+        return False
+    return "episode" not in item or all(
+        row.get("episode", {}).get(k) == value for k, value in item["episode"].items()
+    )
 
 
 def progress(event: dict) -> float | None:
