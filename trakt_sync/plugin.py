@@ -15,6 +15,7 @@ from movieclaw_sdk.events import (
 )
 from pydantic import BaseModel, Field, SecretStr
 
+from .application import application_credentials
 from .client import TraktClient, TraktError
 from .engine import Engine
 from .policy import iso_time
@@ -26,14 +27,14 @@ class Settings(BaseModel):
     enabled: bool = Field(True, title="启用自动追踪", description="只同步已明确绑定的成员")
     client_id: str = Field(
         "",
-        title="Trakt Client ID",
+        title="自定义 Trakt Client ID（高级，可留空）",
         max_length=256,
-        description="在 Trakt Developer 创建自己的 API 应用；不使用其他 App 的密钥",
+        description="默认使用插件专用应用，无需填写。仅部署自己的 Trakt 应用时覆盖此项",
     )
     client_secret: SecretStr = Field(
         SecretStr(""),
-        title="Trakt Client Secret",
-        description="可选；Trakt 已弃用此字段。若填写，仅在服务器使用并由宿主加密保存",
+        title="自定义 Trakt Client Secret（高级，可留空）",
+        description="默认应用不需要。仅配合自定义 Client ID 使用，由宿主加密保存",
     )
 
 
@@ -51,9 +52,10 @@ async def apply(ctx: Context):
         transport=net.http_transport(PLUGIN_ID), timeout=10, follow_redirects=False
     )
     ctx.effect(http.aclose)
-    client = TraktClient(
-        settings.client_id.strip(), settings.client_secret.get_secret_value(), http
+    client_id, client_secret = application_credentials(
+        settings.client_id, settings.client_secret.get_secret_value()
     )
+    client = TraktClient(client_id, client_secret, http)
     engine = Engine(store, client, health, ctx.logger, enabled=settings.enabled)
 
     def listener(kind):

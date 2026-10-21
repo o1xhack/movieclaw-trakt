@@ -26,7 +26,7 @@ class TraktClient:
         headers = {
             "trakt-api-version": "2",
             "trakt-api-key": self.client_id,
-            "User-Agent": "MovieClaw-Trakt/0.1.4",
+            "User-Agent": "MovieClaw-Trakt/0.1.5",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"

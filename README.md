@@ -4,7 +4,7 @@
 
 在 MovieClaw 看电影、追剧，自动同步到你自己的 Trakt 账号。插件装在 MovieClaw 服务器上，手机和电视无需另外安装插件。
 
-**[下载插件 v0.1.4（测试版）](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.4/trakt-sync-0.1.4.mcplugin)** · [版本说明与所有下载](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.1.4)
+**[下载插件 v0.1.5（测试版）](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.5/trakt-sync-0.1.5.mcplugin)** · [版本说明与所有下载](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.1.5)
 
 ## 需要什么版本？
 
@@ -14,9 +14,9 @@
 | iOS 下载后观看、离线记录补传 | **v0.41.0 + [服务端兼容修复](https://github.com/o1xhack/movieclaw/tree/fix/offline-viewing-completion)**；原版 v0.41.0 的重看、较旧记录补传可能漏报 |
 | 其他 MovieClaw 版本 | 尚未验证，不保证兼容 |
 
-需要 MovieClaw 管理员账号、一个 Trakt 账号，以及服务器能连接 Trakt。首次配置还需要创建自己的 Trakt 应用，取得 **Client ID**，方法见下面的安装步骤。
+需要 MovieClaw 管理员账号、一个 Trakt 账号，以及服务器能连接 Trakt。**插件已内置专用 Trakt 应用，普通用户无需申请或填写 Client ID。**
 
-> 当前是测试版。离线链路已完成代码检查和隔离联调，真实 iPhone 飞行模式播放、恢复联网的完整测试尚未完成。v0.1.4 整理了文档和下载入口，播放同步功能与 v0.1.3 相同。
+> 当前是测试版。离线链路已完成代码检查和隔离联调，真实 iPhone 飞行模式播放、恢复联网的完整测试尚未完成。v0.1.5 起，安装后直接连接 Trakt、登录授权即可使用。
 
 ## 能做什么？
 
@@ -35,7 +35,7 @@
 
 ### 1. 下载插件包
 
-点击 **[下载 trakt-sync-0.1.4.mcplugin](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.4/trakt-sync-0.1.4.mcplugin)**，保存到电脑。
+点击 **[下载 trakt-sync-0.1.5.mcplugin](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.1.5/trakt-sync-0.1.5.mcplugin)**，保存到电脑。
 
 文件保持 `.mcplugin` 格式，**不用解压，也不用下载 GitHub 的 Source code**。不需要运行命令或安装 Python。
 
@@ -49,16 +49,7 @@
 
 插件需要读取播放活动、连接 Trakt，并保存账号授权和同步队列；不申请删除媒体或访问媒体文件的权限。
 
-### 3. 获取并填写 Client ID（只做一次）
-
-1. 打开 [Trakt 应用管理页面](https://developer.trakt.tv/apps)，登录你的 Trakt 账号。
-2. 按页面提示创建一个自己使用的应用，名称可以用 `MovieClaw Trakt Personal`。如果 Trakt 要求先绑定 GitHub，按提示完成。
-3. 复制新应用的 **Client ID**。
-4. 回到 MovieClaw 的「Trakt 自动追踪」插件设置，粘贴到 **Trakt Client ID** 并保存。**Client Secret 可以留空**。
-
-这里填写的是你自己创建的 Trakt 应用编号，不是 Trakt 密码。仓库和插件包不附带共享的应用凭据。
-
-### 4. 连接 Trakt 账号
+### 3. 登录并授权 Trakt
 
 1. 在 MovieClaw 网页侧边栏打开 **Trakt**。
 2. 如果只给管理员自己使用，保留默认的 **成员 ID `0`**。
@@ -78,6 +69,8 @@
 | 为什么离线记录没有立即上传？ | App 需要再次运行并连接 MovieClaw；App 被彻底关闭时不会保证自动补传。完整支持还需要上表的服务端修复 |
 | 为什么有的影片被跳过？ | 内容需要可识别的 TMDB / IMDb 等编号；插件不会仅凭标题猜测 |
 | 如何断开？ | 在 Trakt 页面点「断开连接」；Trakt 已有观看历史不会被删除 |
+
+**高级选项：** 需要部署自己 Trakt 应用的用户，仍可在插件设置中填写自定义 Client ID；普通用户保持留空。已有自定义配置不会在升级时被覆盖。
 
 不要同时让多个工具向同一 Trakt 账号提交同一次观看，否则仍可能重复记录。
 

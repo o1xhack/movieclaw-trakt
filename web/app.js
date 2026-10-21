@@ -20,7 +20,7 @@ async function refresh() {
   const id = member();
   const s = await api("status", "GET", id);
   if (id !== member()) return;
-  $("status").textContent = !s.configured ? "请先在插件设置填写 Trakt 应用凭据" :
+  $("status").textContent = !s.configured ? "Trakt 应用配置不可用，请检查插件安装或高级设置" :
     !s.connected ? "尚未连接" : `已连接 ${s.username || "Trakt"}；待同步 ${s.pending} 条${s.last_error ? `；${s.last_error}` : ""}`;
   $("connect").disabled = !s.configured || s.connected;
   $("disconnect").disabled = !s.connected;

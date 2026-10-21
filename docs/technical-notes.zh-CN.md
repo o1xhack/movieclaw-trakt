@@ -1,6 +1,12 @@
-# 技术说明与开发
+# 默认应用与高级配置
 
 [返回安装说明](../README.md) · [English](technical-notes.en.md)
+
+v0.1.5 内置独立的 MovieClaw Trakt 应用（Production / Approved），通过官方设备授权流程连接各用户自己的账号。公开 Client ID 不是用户令牌；插件包不包含 Client Secret。自定义 Client ID 留空或仅含空格时使用默认应用，遗留的自定义 Secret 不会混入默认应用的请求。
+
+只有部署自己的 Trakt 应用时，才需要在插件设置填写自定义 Client ID。已有自定义值会继续生效，不会自动切换其他应用；切换不同应用前需先断开原连接再授权。使用同一个插件专用应用的既有绑定，在清空自定义字段后可以保留，无需重新授权。
+
+## 技术说明与开发
 
 已验证 MovieClaw v0.41.0 / SDK 1.0。事件及服务要求见 [插件清单](../movieclaw-plugin.toml)。
 
@@ -46,7 +52,7 @@ PYTHONPATH="$MOVIECLAW_SOURCE/src" .venv/bin/python -m pytest -q
 .venv/bin/python scripts/package.py
 ```
 
-打包采用文件白名单；不包含本地设置、凭据、虚拟环境或测试数据。源码不携带任何部署的 Client ID。自动化测试使用虚构凭据与模拟 Trakt 响应，不需要真实账号，不向真实观看历史写入测试记录。
+打包采用文件白名单；不包含本地设置、凭据、虚拟环境或测试数据。源码只包含插件专用应用的公开 Client ID，不包含任何 Client Secret、用户授权令牌或私人部署配置。自动化测试使用虚构凭据与模拟 Trakt 响应，不需要真实账号，不向真实观看历史写入测试记录。
 
 
 ## 下载校验（可选）
@@ -62,5 +68,5 @@ shasum -a 256 -c SHA256SUMS
 已配置 mclaw 的管理员可以运行下列命令，再到插件页面查看权限并批准安装：
 
 ```sh
-mclaw app plugins packages upload --file trakt-sync-0.1.4.mcplugin
+mclaw app plugins packages upload --file trakt-sync-0.1.5.mcplugin
 ```

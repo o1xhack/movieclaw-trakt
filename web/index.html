@@ -2,7 +2,8 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Trakt 自动追踪</title><link rel="stylesheet" href="style.css"></head><body>
 <main><h1>Trakt 自动追踪</h1><p>将 MovieClaw 的播放活动同步到你绑定的 Trakt 账号。</p>
-<p>先在<a href="/settings/plugins" target="_top">插件设置</a>填写自己 Trakt 应用的 Client ID（Client Secret 可留空），再为成员连接账号。</p>
+<p>已内置插件专用的 Trakt 应用，直接点击「连接 Trakt」，按提示登录并确认授权即可。不需要申请或填写 Client ID。</p>
+<details><summary>高级：使用自己的 Trakt 应用</summary><p>仅在需要覆盖默认应用时，前往<a href="/settings/plugins" target="_top">插件设置</a>填写自定义 Client ID。普通用户保持留空即可。</p></details>
 <section><label for="member">MovieClaw 成员 ID（管理员为 0）</label>
 <input id="member" type="number" min="0" value="0"><button id="refresh">查看状态</button>
 <p class="hint">每个成员独立绑定；没有绑定的成员不会同步。这里只允许管理员操作。</p></section>

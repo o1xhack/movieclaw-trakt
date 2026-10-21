@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5
+
+- 内置独立的 MovieClaw Trakt 公开应用，安装后直接登录授权，无需申请或填写 Client ID。
+- 自定义应用保留为高级选项；空白字段回退默认应用，旧自定义 Secret 不会混入默认请求。
+- 保留已有自定义配置及同应用账号绑定，更新中英文安装、页面提示和隐私说明。
+- Bundle the dedicated public Trakt application for sign-in without manual Client ID setup.
+- Keep custom applications as an optional override; blank values use the default without a stale custom secret.
+- Preserve existing custom settings and same-application connections; update bilingual guides and privacy notes.
+
 ## 0.1.4
 
 - 默认中文 README，新增完整英文版，明确宿主版本要求、功能和网页安装流程。

@@ -1,6 +1,12 @@
-# Technical notes and development
+# Default application and advanced configuration
 
 [Back to installation](../README.en.md) · [中文](technical-notes.zh-CN.md)
+
+v0.1.5 includes a dedicated MovieClaw Trakt application (Production / Approved). Each user connects their own account through the official device authorization flow. The public Client ID is not a user token; no Client Secret is bundled. An empty or whitespace-only custom Client ID selects the default application. A leftover custom secret is never sent with the default application.
+
+Only fill in a custom Client ID when deploying your own Trakt application. Existing custom values remain active on update; they are not silently replaced. Disconnect and authorize again before switching to a different application. An existing connection made through the same dedicated plugin application survives clearing the custom field, without reauthorization.
+
+## Technical notes and development
 
 ## Compatibility and playback rules
 
@@ -27,7 +33,7 @@ iOS already journals by viewing UUID, cleans up acknowledged records, and retrie
 - Each member authorizes independently; an unconnected member never falls back to the administrator's account. Web management is administrator-only.
 - The plugin listens to four playback events, reaches Trakt, and uses separate data storage. It requests no media deletion, media file paths, or other host operations.
 - Its web page shares MovieClaw's origin and uses the administrator session. Only install plugin code you trust.
-- Use a Client ID from your own Trakt application. Client Secret may be blank; if supplied, it is encrypted on the server. Do not reuse another app's credentials.
+- A dedicated Trakt application is built in. Only enter a custom Client ID if deploying your own application. Client Secret may be blank; if supplied for a custom application, it is encrypted on the server. Do not reuse another app's credentials.
 - Updates with the same plugin ID retain storage. Disconnect before changing Client ID, then authorize the new application.
 - Disabling stops new playback events while retaining queued requests. Uninstall data handling follows the host's options.
 - Network failures retry with backoff. Authorization errors retain the queue and request reconnection. **Reconnecting clears the old queue and does not backfill those watches.**
@@ -50,7 +56,7 @@ shasum -a 256 -c SHA256SUMS
 Most users should follow the web steps in the [README](../README.en.md). Administrators with `mclaw` configured can also upload using:
 
 ```sh
-mclaw app plugins packages upload --file trakt-sync-0.1.4.mcplugin
+mclaw app plugins packages upload --file trakt-sync-0.1.5.mcplugin
 ```
 
 Then review permissions and approve installation on the MovieClaw plugin page.
@@ -68,4 +74,4 @@ PYTHONPATH="$MOVIECLAW_SOURCE/src" .venv/bin/python -m pytest -q
 .venv/bin/python scripts/package.py
 ```
 
-Packaging uses an allowlist and includes both documentation languages. Local settings, credentials, virtual environments, and test data are excluded. No deployed Client ID is bundled. Automated tests use fictional credentials and mocked Trakt responses without adding records to a real watch history.
+Packaging uses an allowlist and includes both documentation languages. Local settings, credentials, virtual environments, and test data are excluded. Only the dedicated plugin application's public Client ID is bundled; there is no Client Secret, user token, or private deployment configuration. Automated tests use fictional credentials and mocked Trakt responses without adding records to a real watch history.

@@ -54,7 +54,7 @@ class Engine:
 
     async def begin(self, member):
         if not self.client.client_id:
-            raise ValueError("请先在插件设置里填写自己的 Trakt Client ID")
+            raise ValueError("Trakt 应用配置不可用，请检查插件安装或高级应用设置")
         async with self.locks[member]:
             if (await self.get(member, "account", {})).get("access_token"):
                 raise ValueError("该成员已绑定，请先断开连接再更换账号")
