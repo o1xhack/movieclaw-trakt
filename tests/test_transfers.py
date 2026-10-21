@@ -158,6 +158,52 @@ async def test_import_30000_history_records_pages_400_local_units_and_incrementa
     assert [r.url.path for r in requests] == ["/sync/last_activities"]
 
 
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("scan_delay", [0, 120])
+async def test_import_reconsiders_post_cutoff_watches_with_unchanged_activity(
+    harness, kind, scan_delay
+):
+    records = []
+    stamp = {}
+    path = "/sync/history/" + ("movies" if kind == "movie" else "episodes")
+
+    def handler(r):
+        if r.url.path == "/sync/last_activities":
+            return httpx.Response(200, json=stamp)
+        if r.url.path == path:
+            return httpx.Response(200, json=records, headers={"X-Pagination-Page-Count": "1"})
+
+    e, _, clock, requests = await harness(handler)
+    ops = Ops([unit(kind=kind, season=int(kind == "tv"), episode=int(kind == "tv"))])
+    t = Transfers(e, ops)
+    task = await t.create(0, "import")
+    # Either already future-dated, or added while the local scan is still in progress.
+    eligible_at = clock[0] + 60
+    when = iso_time(eligible_at)
+    clock[0] += scan_delay
+    records.append(remote(1, episode=1 if kind == "tv" else None, when=when))
+    stamp["movies" if kind == "movie" else "episodes"] = {"watched_at": when}
+    task = await drive(t, task, "ready", clock)
+    assert task["total"] == 0 and not ops.writes
+    await t.confirm(0, task["id"], task["preview_token"])
+    await drive(t, task, "complete", clock)
+    assert not await e.get(0, "import_stamp")
+
+    clock[0] = max(clock[0], eligible_at + 1)
+    requests.clear()
+    task = await drive(Transfers(e, ops), await t.create(0, "import"), "ready", clock)
+    assert task["total"] == 1 and any(r.url.path == path for r in requests)
+    await t.confirm(0, task["id"], task["preview_token"])
+    await drive(t, task, "complete", clock)
+    assert len(ops.writes) == 1 and ops.writes[0]["watched_at"] == when
+    assert await e.get(0, "import_stamp")
+
+    requests.clear()
+    task = await drive(t, await t.create(0, "import"), "ready", clock)
+    assert task["total"] == 0
+    assert [r.url.path for r in requests] == ["/sync/last_activities"]
+
+
 async def test_import_lost_response_retries_idempotently_and_preserves_rewatch_versions(harness):
     def handler(r):
         if r.url.path == "/sync/last_activities":

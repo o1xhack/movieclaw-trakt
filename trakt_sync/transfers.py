@@ -235,7 +235,12 @@ class Transfers:
                 )
             )
             when = remote.get("watched_at")
-            if not when or timestamp(when) > timestamp(task["cutoff"]):
+            if not when:
+                continue
+            if timestamp(when) > timestamp(task["cutoff"]):
+                # The activity stamp already includes this record. Revisit it on a later scan
+                # once eligible, even if Trakt's activity stamp and local inventory stay unchanged.
+                task["post_cutoff_records"] = True
                 continue
             unit = None
             for key in ("tmdb", "imdb"):
@@ -452,6 +457,7 @@ class Transfers:
                 task["state"] == "complete"
                 and task["direction"] == "import"
                 and any(task["remote_stamp"])
+                and not task.get("post_cutoff_records")
             ):
                 await self.e.set(task["member_id"], "import_stamp", self.import_stamp(task))
             return
