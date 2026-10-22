@@ -1,3 +1,5 @@
+> **Development only: 0.3.0-beta.1.** Requires the unreleased MovieClaw history APIs (#973). Wait for the upstream server release before acceptance testing. Production and market releases come from `main`.
+
 # MovieClaw Trakt
 
 [中文](README.md) · English

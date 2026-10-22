@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — Unreleased / 未发布
+## 0.3.0-beta.1 (development, requires unreleased server APIs) — Unreleased / 未发布
 
 - 三个独立、默认关闭的成员偏好：手动已看、取消已看、收藏加入 Watchlist。仅管理员管理，成员自助设置留 Backlog，不提供个人评分。
 - 实时事件分块落盘、失败重试、按成员和账号隔离，后续操作不越过较早失败任务。

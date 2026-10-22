@@ -1,3 +1,5 @@
+> **开发分支：0.3.0-beta.1。** 依赖尚未发布的 MovieClaw 历史同步 API（上游 #973），等待服务器版本发布后联调。不要安装到生产环境，不提交插件市场；正式可用版本在 `main`。
+
 # MovieClaw Trakt 自动追踪
 
 中文 · [English](README.en.md)
