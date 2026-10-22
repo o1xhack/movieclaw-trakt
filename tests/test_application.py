@@ -1,11 +1,12 @@
 import logging
 
 import httpx
-from conftest import Health, Store
 
 from trakt_sync.application import DEFAULT_CLIENT_ID, application_credentials
 from trakt_sync.client import TraktClient
 from trakt_sync.engine import Engine
+
+from .conftest import Health, Store
 
 
 async def test_existing_dedicated_app_binding_survives_switch_to_empty_configuration():

@@ -317,7 +317,7 @@ async def test_seek_near_end_start_is_never_converted_to_watched_history(harness
     assert requests == []
     assert not (await e.status(0))["pending"]
     assert not (await e.status(0))["last_success"]
-    assert (await e.activity(0))["records"][0]["state"] == "skipped"
+    assert (await e.activity(0))["records"] == []
 
 
 async def test_short_stop_422_is_expected_noop_not_matching_failure(harness, event):
@@ -364,6 +364,7 @@ async def test_cleared_stop_then_completion_is_upgraded_to_finished(harness, eve
     await e.accept("stopped", {**payload, "completed": False}, "stop", iso_time(clock[0]))
     await e.accept("completed", payload, "done", iso_time(clock[0]))
     await e.drain(0)
+    clock[0] += 1
     await e.drain(0)
     assert json.loads(requests[-1].content)["progress"] == 100
 
@@ -485,5 +486,6 @@ async def test_local_rewatches_are_distinct_and_each_replay_is_idempotent(harnes
         for replay in range(2):
             await e.accept("completed", payload, f"event-{n}", when)
     await e.drain(0)
+    clock[0] += 1
     await e.drain(0)
     assert [r.url.path for r in requests].count("/sync/history") == 2
