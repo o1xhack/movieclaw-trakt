@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: movieclaw/MovieClaw
-          ref: v0.41.0
+          ref: bd325adde24e5e035878d3fb668cd0b004c96760 # v0.42.0
           path: .sdk
       - uses: actions/setup-python@v5
         with:

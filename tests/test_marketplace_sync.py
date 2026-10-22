@@ -40,7 +40,15 @@ def release(tag):
 def source(tmp_path):
     root = tmp_path / "source"
     init(root)
-    for name in ["README.md", "README.en.md", "LICENSE", "PRIVACY.md", "CHANGELOG.md"]:
+    for name in [
+        "README.md",
+        "README.en.md",
+        "LICENSE",
+        "PRIVACY.md",
+        "CHANGELOG.md",
+        "APPLICATION.md",
+        "SOURCE.md",
+    ]:
         (root / name).write_text("fixture\n")
     for folder in ["marketplace/tests", "trakt_sync", "web"]:
         (root / folder).mkdir(parents=True)

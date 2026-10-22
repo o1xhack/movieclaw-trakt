@@ -2,21 +2,24 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from conftest import Health, Store
 from fastapi import FastAPI
 from movieclaw_api.plugins.keys import PLUGIN_DATA, PLUGIN_HEALTH, PLUGIN_ROUTES
 from movieclaw_kernel import DURABLE_EVENTS, DeliveryInfo, Origin
 from movieclaw_kernel.observe import current_delivery
 from movieclaw_kernel.testing import KernelHarness
 from movieclaw_sdk.events import PLAYBACK_COMPLETED, PLAYBACK_PROGRESS, Playback
+from movieclaw_sdk.ops import HOST_OPS
 
 from trakt_sync.application import DEFAULT_CLIENT_ID
 from trakt_sync.engine import Engine
 from trakt_sync.plugin import apply
 from trakt_sync.policy import iso_time
+
+from .conftest import Health, Store
 
 
 @pytest.mark.parametrize(
@@ -92,6 +95,12 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
         h.provide(PLUGIN_DATA, SimpleNamespace(scoped=lambda _: store))
         h.provide(PLUGIN_HEALTH, SimpleNamespace(reporter=lambda _: Health()))
         h.provide(PLUGIN_ROUTES, SimpleNamespace(mount=mount))
+        h.provide(
+            HOST_OPS,
+            SimpleNamespace(
+                client=AsyncMock(return_value=SimpleNamespace(call=AsyncMock(return_value=[])))
+            ),
+        )
         h.provide(DURABLE_EVENTS, SimpleNamespace(subscribe=subscribe))
         fiber = await h.mount(apply, config=config)
         assert fiber.state.value == "active"

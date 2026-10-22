@@ -21,6 +21,9 @@ def build(output):
             "docs/technical-notes.en.md",
             "LICENSE",
             "PRIVACY.md",
+            "APPLICATION.md",
+            "SOURCE.md",
+            "CHANGELOG.md",
         )
     ]
     files += sorted((ROOT / "trakt_sync").glob("*.py"))

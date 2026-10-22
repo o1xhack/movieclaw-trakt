@@ -1,18 +1,31 @@
 """Trakt 的官方 HTTPS 接口；错误只带状态码，不回显账号凭据或响应正文。"""
 
 import time
+import tomllib
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 
 API_URL = "https://api.trakt.tv"
+VERSION = tomllib.loads(
+    (Path(__file__).resolve().parents[1] / "movieclaw-plugin.toml").read_text(encoding="utf-8")
+)["plugin"]["version"]
 
 
 class TraktError(Exception):
-    def __init__(self, status: int, *, retry_after: float = 60, uncertain: bool = False):
+    def __init__(
+        self,
+        status: int,
+        *,
+        retry_after: float = 60,
+        uncertain: bool = False,
+        auth_error: bool = False,
+    ):
         self.status = status
         self.retry_after = max(1, min(retry_after, 86400))
         self.uncertain = uncertain
+        self.auth_error = auth_error or status in (401, 403)
         super().__init__(f"Trakt 请求未完成（HTTP {status}）")
 
 
@@ -26,7 +39,7 @@ class TraktClient:
         headers = {
             "trakt-api-version": "2",
             "trakt-api-key": self.client_id,
-            "User-Agent": "MovieClaw-Trakt/0.2.1",
+            "User-Agent": f"MovieClaw-Trakt/{VERSION}",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -45,6 +58,7 @@ class TraktClient:
                 response.status_code,
                 retry_after=retry,
                 uncertain=method == "POST" and response.status_code >= 500,
+                auth_error=path == "/oauth/token" and response.status_code == 400,
             )
         try:
             return response.json() if response.content else {}
@@ -83,6 +97,7 @@ class TraktClient:
                 **self.application_fields(),
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
+                "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
             },
         )
 

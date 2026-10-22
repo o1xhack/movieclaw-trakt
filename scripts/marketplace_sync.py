@@ -64,6 +64,8 @@ def files(root):
         "LICENSE",
         "PRIVACY.md",
         "CHANGELOG.md",
+        "APPLICATION.md",
+        "SOURCE.md",
         "marketplace/store.json",
     ]
     for folder, pattern in [
