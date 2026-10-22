@@ -1,3 +1,5 @@
+> **开发分支：0.3.0-beta.1。** 依赖尚未发布的 MovieClaw 历史同步 API（上游 #973），等待服务器版本发布后联调。不要安装到生产环境，不提交插件市场；正式可用版本在 `main`。
+
 # MovieClaw Trakt 自动追踪
 
 中文 · [English](README.en.md)
@@ -5,6 +7,12 @@
 在 MovieClaw 看电影、追剧，自动同步到你自己的 Trakt 账号。插件装在 MovieClaw 服务器上，手机和电视无需另外安装插件。
 
 **[下载插件 v0.2.1（测试版）](https://github.com/o1xhack/movieclaw-trakt/releases/download/v0.2.1/trakt-sync-0.2.1.mcplugin)** · [版本说明与所有下载](https://github.com/o1xhack/movieclaw-trakt/releases/tag/v0.2.1)
+
+## 开发中的 0.3.0（尚未发布）
+
+新增三个默认关闭的成员同步开关（手动已看、取消已看、收藏加入 Watchlist），以及活动类型／状态组合筛选。另提供**手动扫描 → 全量预览 → Confirm → 前台逐批写入**的双向观看历史同步与独立 History 页面。**本开发版安装需要配套上游新增的两个 API，原版 v0.41.0 无法安装；尚未发布。** 不新增端口，不自动扫描或转后台。当前仍由管理员按成员管理，成员自助设置留在 Backlog。详见[实现范围与验证](docs/sync-workflow.zh-CN.md)。
+
+以下下载与安装说明针对已发布的 v0.2.1；本地开发包尚未在用户服务器安装验收。
 
 ## 需要什么版本？
 
@@ -32,7 +40,7 @@
 
 仅追踪**向 MovieClaw 上报播放活动**的客户端。独立连接 Plex 的 Infuse 播放不会经过本插件。暂停按钮能否立即反映到 Trakt 受 MovieClaw 的事件支持限制；当前主要在退出播放器时同步停止状态。
 
-本插件不导入过去的观看历史，不同步收藏或评分，也不会把 Trakt 进度反向写回 MovieClaw。
+以上是已发布 v0.2.1 的功能；开发版历史与收藏同步见上方说明。所有版本都不提供个人评分或双向播放进度同步。
 
 ## 如何安装？
 

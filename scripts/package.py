@@ -19,6 +19,7 @@ def build(output):
             "README.en.md",
             "docs/technical-notes.zh-CN.md",
             "docs/technical-notes.en.md",
+            "docs/sync-workflow.zh-CN.md",
             "LICENSE",
             "PRIVACY.md",
         )
