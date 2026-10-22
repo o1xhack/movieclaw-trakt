@@ -80,3 +80,5 @@
 [技术说明、排错与开发](docs/technical-notes.zh-CN.md) · [隐私与授权](PRIVACY.md) · [更新日志](CHANGELOG.md) · [反馈问题](https://github.com/o1xhack/movieclaw-trakt/issues)
 
 本项目是独立社区插件，非 MovieClaw 或 Trakt 官方产品，未获 Trakt 背书或认证。
+
+维护者：[正式版发布到插件市场的自动 PR 流程](docs/marketplace-release.zh-CN.md)（默认关闭，真实演练待后续）。

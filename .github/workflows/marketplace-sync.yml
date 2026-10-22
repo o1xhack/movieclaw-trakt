@@ -1,0 +1,170 @@
+name: Sync release to plugin market
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已发布的插件正式版 tag，例如 v0.3.1'
+        required: true
+        type: string
+      apply:
+        description: '实际提交 PR（还要求该版本配置 enabled=true 和专用 token）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+concurrency:
+  group: trakt-marketplace-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || (!github.event.release.draft && !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      submit: ${{ steps.plan.outputs.submit }}
+      market_sha: ${{ steps.plan.outputs.market_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+          path: release-src
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Select preview or enabled publication
+        id: gate
+        env:
+          APPLY: ${{ github.event_name == 'release' || inputs.apply }}
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          config = tomllib.loads(Path('release-src/marketplace/release.toml').read_text())
+          enabled = config.get('enabled')
+          if type(enabled) is not bool:
+              raise SystemExit('enabled 必须是布尔值')
+          eligible = os.environ['APPLY'] != 'true' or enabled
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print(f'eligible={str(eligible).lower()}', file=out)
+          if not eligible:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+                  print('此版本未开启市场自动提交，已跳过；没有写入任何外部仓库。', file=out)
+          PY
+      - name: Verify published releases and build candidate
+        if: steps.gate.outputs.eligible == 'true'
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          APPLY: ${{ github.event_name == 'release' || inputs.apply }}
+        run: |
+          args=()
+          if [ "$APPLY" = true ]; then args+=(--apply); fi
+          python scripts/marketplace_sync.py prepare --source release-src --output candidate --tag "$RELEASE_TAG" "${args[@]}"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          plan = json.loads(Path('candidate/plan.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key in ('market_sha', 'host_sha', 'market_pin'):
+                  print(f'{key}={plan[key]}', file=out)
+              print(f'submit={os.environ["APPLY"]}', file=out)
+          PY
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.eligible == 'true'
+        with:
+          repository: movieclaw/MovieClaw
+          ref: ${{ steps.plan.outputs.host_sha }}
+          path: .target-host
+          persist-credentials: false
+      - name: Target stable host checks and original plugin tests
+        if: steps.gate.outputs.eligible == 'true'
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.target-host/src
+        run: |
+          python -m pip install -r release-src/requirements-dev.txt -e .target-host
+          python .target-host/src/movieclaw_agent/builtin-skills/movieclaw-plugin-dev/scripts/check_plugin.py candidate/plugin
+          python -m unittest discover -s candidate/plugin/tests -t candidate/plugin -v
+          cd release-src
+          python -m pytest -q
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.eligible == 'true'
+        with:
+          repository: movieclaw/MovieClaw
+          ref: ${{ steps.plan.outputs.market_pin }}
+          path: .market-host
+          persist-credentials: false
+      - name: Market host compatibility and smoke tests
+        if: steps.gate.outputs.eligible == 'true'
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.market-host/src
+        run: |
+          python -m pip install -e .market-host
+          python .market-host/src/movieclaw_agent/builtin-skills/movieclaw-plugin-dev/scripts/check_plugin.py candidate/plugin
+          python -m unittest discover -s candidate/plugin/tests -t candidate/plugin -v
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.eligible == 'true'
+        with:
+          repository: movieclaw/movieclaw-plugins
+          ref: ${{ steps.plan.outputs.market_sha }}
+          fetch-depth: 0
+          path: market-src
+          persist-credentials: false
+      - name: Validate catalog and package without publishing
+        if: steps.gate.outputs.eligible == 'true'
+        run: |
+          python -m pip install jsonschema
+          mkdir -p market-src/plugins/trakt-sync
+          rsync -a --delete candidate/plugin/ market-src/plugins/trakt-sync/
+          cd market-src
+          python scripts/generate_index.py --lint
+          python scripts/generate_index.py --update
+          python scripts/generate_index.py --check index.json
+          python scripts/pack.py plugins/trakt-sync --output ../candidate/trakt-sync.mcplugin
+          cp index.json ../candidate/index.json
+          cd ..
+          python scripts/marketplace_sync.py record-validation --candidate candidate
+          echo '候选目录、兼容性测试和索引检查通过。预览模式不会创建分支或 PR。' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.eligible == 'true'
+        with:
+          name: market-candidate
+          path: candidate/
+          retention-days: 7
+  submit:
+    needs: prepare
+    if: needs.prepare.outputs.submit == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: market-candidate
+          path: candidate
+      - uses: actions/checkout@v4
+        with:
+          repository: movieclaw/movieclaw-plugins
+          ref: ${{ needs.prepare.outputs.market_sha }}
+          fetch-depth: 0
+          path: market-src
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create or reuse the version PR
+        env:
+          GH_TOKEN: ${{ secrets.MARKETPLACE_PR_TOKEN }}
+        run: python scripts/marketplace_sync.py submit --candidate candidate --market market-src
