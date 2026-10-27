@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from trakt_sync.actions import Actions
+from trakt_sync.engine import Engine
 from trakt_sync.policy import history_body, identity, timestamp
 from trakt_sync.preferences import Preferences
 from trakt_sync.transfers import Transfers
@@ -279,3 +280,120 @@ async def test_export_does_not_match_next_minute_at_fractional_boundary(harness,
     done = await drive(t, task, "complete")
     assert done["done"] == 1 and len(service.posts) == 1
     assert len(service.rows["movies" if kind == "movie" else "episodes"]) == 2
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("timing", ["dispatch", "arrival", "process_exit", "refresh", "refresh401"])
+async def test_uncertain_native_scrobble_matches_dispatch_window_after_restart(
+    harness, kind, timing
+):
+    service = MinuteService()
+    row = local(kind, "2020-01-01T12:34:59Z")
+    event = {
+        "member_id": 0,
+        "media": row["media"],
+        "unit": row,
+        "position_ms": 100,
+        "duration_ms": 100,
+        "client": {"device_id": "fixture"},
+    }
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            clock[0] += 61
+            return httpx.Response(
+                200, json={"access_token": "new", "refresh_token": "new-r", "expires_in": 3600}
+            )
+        if request.url.path == "/scrobble/stop":
+            # The server assigns watched_at; the request carries no original timestamp.
+            assert "watched_at" not in json.loads(request.content)
+            if (
+                timing == "refresh401"
+                and request.headers["Authorization"] == "Bearer fixture-access"
+            ):
+                clock[0] += 61
+                return httpx.Response(401)
+            if timing in {"arrival", "process_exit"}:
+                clock[0] += 2
+            service.seed(target(row), datetime.fromtimestamp(clock[0], timezone.utc).isoformat())
+            if timing == "process_exit":
+                raise RuntimeError("fixture process exit after native scrobble commit")
+            raise httpx.ReadError("committed stop response lost", request=request)
+        return service(request)
+
+    e, store, clock, _ = await harness(handler)
+    clock[0] = timestamp("2020-01-01T12:35:01Z" if timing == "dispatch" else "2020-01-01T12:34:59Z")
+    if timing == "refresh":
+        account = await e.get(0, "account")
+        account["expires_at"] = clock[0]
+        await e.set(0, "account", account, secret=True)
+    await e.accept("completed", event, "native", row["watches"][0]["watched_at"])
+    if timing == "process_exit":
+        with pytest.raises(RuntimeError):
+            await e.drain(0)
+    else:
+        await e.drain(0)
+    clock[0] += 120
+    restarted = Engine(store, e.client, e.health, e.log, clock=e.clock)
+    await restarted.drain(0)
+    assert not (await restarted.status(0))["pending"]
+    assert not service.posts and sum(map(len, service.rows.values())) == 1
+
+
+async def test_explicit_history_retry_clears_native_dispatch_window(harness, event):
+    service = MinuteService(lose_response=True)
+
+    def handler(request):
+        if request.url.path == "/scrobble/stop":
+            raise httpx.ReadError("uncommitted native request", request=request)
+        return service(request)
+
+    e, store, clock, _ = await harness(handler)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    await e.accept("completed", event, "native", "2020-01-01T12:34:59Z")
+    await e.drain(0)
+    for _ in range(2):
+        clock[0] += 120
+        e = Engine(store, e.client, e.health, e.log, clock=e.clock)
+        await e.drain(0)
+    assert not (await e.status(0))["pending"]
+    assert len(service.posts) == 1
+    assert service.rows["movies"][0]["watched_at"] == "2020-01-01T12:34:00Z"
+
+
+async def test_observed_native_error_does_not_match_a_later_distinct_watch(harness, event):
+    service = MinuteService()
+
+    def handler(request):
+        if request.url.path == "/scrobble/stop":
+            raise httpx.ReadError("uncommitted native request", request=request)
+        return service(request)
+
+    e, _, clock, _ = await harness(handler)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    await e.accept("completed", event, "native", "2020-01-01T12:34:59Z")
+    await e.drain(0)
+    service.seed({"movie": {"ids": {"tmdb": 11}}}, "2020-01-01T12:36:00Z")
+    clock[0] += 120
+    await e.drain(0)
+    assert len(service.posts) == 1  # A later, unrelated watch cannot cover the failed request.
+
+
+@pytest.mark.parametrize("status", [400, 429])
+async def test_definite_native_rejection_does_not_reuse_dispatch_window(harness, event, status):
+    service = MinuteService()
+
+    def handler(request):
+        if request.url.path == "/scrobble/stop":
+            return httpx.Response(status)
+        return service(request)
+
+    e, _, clock, _ = await harness(handler)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    service.seed({"movie": {"ids": {"tmdb": 11}}}, "2020-01-01T12:35:00Z")
+    await e.accept("completed", event, "native", "2020-01-01T12:34:59Z")
+    await e.drain(0)
+    clock[0] += 1200
+    await e.drain(0)
+    assert len(service.posts) == 1
+    assert len(service.rows["movies"]) == 2

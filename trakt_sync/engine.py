@@ -1,6 +1,7 @@
 """播放事件持久化与 Trakt 投递；每个成员独立加密凭据、队列和互斥锁。"""
 
 import asyncio
+import copy
 import hashlib
 import json
 import time
@@ -22,6 +23,10 @@ from .policy import (
     trakt_minute,
 )
 from .recovery import LocalStateError, Recovery
+
+
+class DeliveryEvicted(Exception):
+    """Capacity trimming removed the job before its request was sent."""
 
 
 class Engine(ActivityLog, Recovery):
@@ -628,7 +633,9 @@ class Engine(ActivityLog, Recovery):
                     else "缺少有效的外部编号，未发送到 Trakt",
                 )
 
-    async def authorized(self, member, account, method, path, body=None, params=None):
+    async def authorized(
+        self, member, account, method, path, body=None, params=None, *, before_send=None
+    ):
         # 一次投递可能先查历史再写入；前一步可能已经轮换了单次刷新令牌。
         account = await self.get(member, "account", account)
         if member in self.rotated:
@@ -638,11 +645,15 @@ class Engine(ActivityLog, Recovery):
         if account.get("expires_at", 0) <= self.clock() + 120:
             account = await self.refresh(member, account)
         try:
+            if before_send:
+                await before_send()
             return await self.client.request(method, path, body, account["access_token"], params)
         except TraktError as exc:
             if exc.status != 401:
                 raise
             account = await self.refresh(member, account)
+            if before_send:
+                await before_send()
             return await self.client.request(method, path, body, account["access_token"], params)
 
     async def refresh(self, member, account):
@@ -656,6 +667,11 @@ class Engine(ActivityLog, Recovery):
 
     async def history_exists(self, member, account, job):
         when = trakt_minute(job["occurred_at"])
+        end = when
+        window = job.get("scrobble_window")
+        if window and window["item"] == job["item"]:
+            # Native scrobbles receive a server time, unlike explicit history writes.
+            when, end = trakt_minute(window["start"]), trakt_minute(window["end"])
         kind = "movies" if "movie" in job["item"] else "episodes"
         page = 1
         previous = None
@@ -667,13 +683,13 @@ class Engine(ActivityLog, Recovery):
                 f"/sync/history/{kind}",
                 params={
                     "start_at": iso_time(when),
-                    "end_at": iso_time(when + 60),
+                    "end_at": iso_time(end + 60),
                     "limit": 100,
                     "page": page,
                 },
             )
             for row in rows:
-                if matches(job["item"], row) and trakt_minute(row["watched_at"]) == when:
+                if matches(job["item"], row) and when <= trakt_minute(row["watched_at"]) <= end:
                     return True
             if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
                 return False
@@ -682,6 +698,35 @@ class Engine(ActivityLog, Recovery):
                 raise TraktError(502)
             previous = signature
             page += 1
+
+    async def save_inflight(self, member, ledger, job):
+        await self.save_ledger(member, ledger)
+        if not any(j["id"] == job["id"] for j in ledger["queue"]):
+            raise DeliveryEvicted
+
+    async def native_stop(self, member, account, ledger, job):
+        async def before_send():
+            now = self.clock()
+            job["scrobble_window"] = {
+                "start": iso_time(now),
+                # The live client has a 10s per-operation timeout. Keep a bounded
+                # crash envelope; an observed response/error narrows it below.
+                "end": iso_time(now + 60),
+                "item": copy.deepcopy(job["item"]),
+            }
+            await self.save_inflight(member, ledger, job)
+
+        try:
+            return await self.authorized(
+                member, account, "POST", job["path"], job["body"], before_send=before_send
+            )
+        except TraktError as exc:
+            if not exc.uncertain:
+                job.pop("scrobble_window", None)
+            raise
+        finally:
+            if window := job.get("scrobble_window"):
+                window["end"] = iso_time(max(timestamp(window["start"]), self.clock()))
 
     async def drain(self, member):
         async with self.locks[member]:
@@ -759,13 +804,21 @@ class Engine(ActivityLog, Recovery):
                                         "/scrobble/pause",
                                         {**job["item"], "progress": 100},
                                     )
+                            # Persist the change of write contract before POST. If this
+                            # response is lost too, reconcile its explicit source minute.
+                            job.pop("scrobble_window", None)
+                            job["path"] = "/sync/history"
+                            job["body"] = history_body(job["item"], job["occurred_at"])
+                            await self.save_inflight(member, ledger, job)
                             result = await self.authorized(
                                 member,
                                 account,
                                 "POST",
                                 "/sync/history",
-                                history_body(job["item"], job["occurred_at"]),
+                                job["body"],
                             )
+                    elif finished and job["path"] == "/scrobble/stop":
+                        result = await self.native_stop(member, account, ledger, job)
                     else:
                         result = await self.authorized(
                             member, account, "POST", job["path"], job["body"]
@@ -773,6 +826,8 @@ class Engine(ActivityLog, Recovery):
                     if result.get("not_found"):
                         if any(result["not_found"].values()):
                             raise TraktError(404)
+            except DeliveryEvicted:
+                return
             except LocalStateError as exc:
                 if exc.deleted:
                     result = {"action": "local_deleted"}
