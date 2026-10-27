@@ -4,9 +4,8 @@
 """
 
 import os
-import shutil
+import zipfile
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
@@ -41,11 +40,11 @@ def host(tmp_path, monkeypatch):
     reset_auth_state()
     durable_events.reset_state()
     (tmp_path / "plugins").mkdir()
-    shutil.copytree(
-        Path(__file__).resolve().parents[1] / "trakt_sync",
-        tmp_path / "plugins/trakt_sync",
-        ignore=shutil.ignore_patterns("__pycache__"),
-    )
+    from scripts.package import build
+
+    # Boot exactly the allowlisted artifact, including its manifest, not loose source files.
+    with zipfile.ZipFile(build(tmp_path / "package")) as archive:
+        archive.extractall(tmp_path / "plugins")
     (tmp_path / "plugins.yaml").write_text(
         "- id: trakt-sync\n  module: trakt_sync\n  local: true\n  runtime: process\n"
     )

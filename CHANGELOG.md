@@ -1,13 +1,35 @@
 # Changelog
 
-## 0.3.0-beta.1 (development, requires unreleased server APIs) — Unreleased / 未发布
+## 0.3.0-beta.2 (unreleased)
 
-- 三个独立、默认关闭的成员偏好：手动已看、取消已看、收藏加入 Watchlist。仅管理员管理，成员自助设置留 Backlog，不提供个人评分。
-- 实时事件分块落盘、失败重试、按成员和账号隔离，后续操作不越过较早失败任务。
-- 活动类型与发送状态组合筛选，默认观看与收藏；播放噪声有独立保留限额。
-- 历史双向同步依赖配套上游新 catalog/import API：手动扫描、电影／每季分组全量预览、Confirm、前台进度、回执和独立 History 明细。关闭网页不继续下一批，不提供后台批量执行。
-- 原时间、重看、源记录幂等与状态版本冲突保护；分页、Retry-After、响应丢失去重和增量回执。缺少 API 或授权时暂停，不伪造成功。
-- Companion host/plugin integration and 30k-history/400-local-unit tests use mocked Trakt only. Not released or deployed; stock v0.41.0 cannot run the new history feature.
+- Integrate all stable 0.2.3 authentication, queue-capacity, metadata recovery and UI repairs into the separate dev track.
+- Target released MovieClaw v0.43.0 for catalog/import APIs and CI; keep marketplace automation disabled.
+- Add three independent default-off member preferences, activity filters and confirmed foreground history import/export with original movie/episode dates, rewatches, grouped previews and durable incremental receipts. No ratings, member self-service or background bulk transfer.
+- Treat ordinary HTTP 400 as an item error, continue after terminal action failures, and block only the affected Trakt account on authorization rejection. Missing host grants pause a transfer without invalidating Trakt credentials.
+- Retain stable retry/correction/dismissal controls and verify real host durable events, admin-only routes and isolated dated import/export without production account writes.
+
+## 0.2.3 (2026-10-22)
+
+- Prevent a completion evicted by capacity trimming after metadata revalidation from being sent without a persisted recovery record.
+- Remove delivered or failed jobs by identity, so capacity trimming cannot silently discard the following completion or pop an empty queue.
+- Add regressions for near-limit two-job and single-job queues, plus remote-success/process-exit recovery while capacity trimming removes a heartbeat. Capacity evictions retain the existing explicit loss count.
+
+## 0.2.2 (2026-10-22)
+
+- Revalidate failed deliveries using current library metadata and stable file IDs; retire deleted entries and expired live events, and retry transient metadata failures.
+- Check paginated Trakt history before replaying a completion, preserving its original watch time; add season/episode correction and dismissal for legacy failures.
+- Display retained failure counts, accurate matching errors and retry deadlines. Request only two read-only metadata operations, with no filesystem access.
+- Keep server-dependent features on dev / v0.3.0-beta.1, separate from stable main and marketplace releases.
+
+- Prevent a full queue or rejected authorization from blocking the host's shared durable consumer; bound the ledger, prefer expiring live jobs and discarding heartbeats, and show dropped completion counts.
+- Pause members with rejected authorization until reconnect, clear unusable queued work, and preserve freshly rotated credentials.
+- Wake delivery only for pending work using a plaintext scheduling index; keep heartbeat requests out of the activity log.
+- Use the manifest version in User-Agent and add mocked OAuth, overflow, migration and retry regression coverage.
+- Install/update guidance now follows the official plugin market. Remove server-fork recommendations and unsupported offline-history guarantees.
+- Use the MovieClaw-owned public application with secretless device authorization and OOB refresh.
+- Treat item-write 400 as a retryable item failure; distinguish OAuth refresh rejection. Add loss-warning acknowledgement with preserved totals and independent connection health.
+- Isolate corrupt legacy credentials and back off unexpected delivery errors per member. Specify UTF-8 manifest decoding.
+- Validate against the repository's pinned MovieClaw v0.42.0 host; see APPLICATION.md for application maintenance.
 
 ## 0.2.1
 
@@ -39,9 +61,7 @@
 ## 0.1.3
 
 - Honor explicit completion events even when MovieClaw resets the resume position to zero.
-- Preserve the original timestamp for local viewing completions identified by `viewing_id`, including recent uploads.
-- Isolate local viewing sessions by UUID; clear matching live watching without creating a second completed record.
-- Document the generic v0.41.0 server compatibility fix required for complete offline rewatch and out-of-order replay support.
+- Add optional handling for host extensions carrying `viewing_id`; the public playback contract does not guarantee that field. Complete offline rewatch and out-of-order history are not supported guarantees.
 
 ## 0.1.2
 

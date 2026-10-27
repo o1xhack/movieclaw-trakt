@@ -8,10 +8,10 @@ from .policy import iso_time
 def error_reason(status):
     return {
         0: "网络连接失败，将自动重试",
-        400: "授权请求未被接受，请检查账号连接",
+        400: "Trakt 无法接受此条记录，请检查影片或季集编号",
         401: "账号授权已失效，请重新连接",
         403: "Trakt 拒绝访问，请检查账号权限",
-        404: "Trakt 未找到对应影片，请检查外部编号",
+        404: "Trakt 未匹配此影片或季集，等待核对最新编号",
         422: "Trakt 无法接受此播放记录，请检查影片或季集编号",
         429: "Trakt 请求频率受限，稍后自动重试",
     }.get(status, "Trakt 服务暂时不可用，将自动重试")
@@ -78,7 +78,8 @@ class ActivityLog:
             self.log.warning("Trakt 发送详情暂未保存，投递队列不受影响")
 
     async def accounts(self):
-        scopes = await self.store.scopes("account", entity="member")
+        await self.initialize()
+        scopes = await self.store.scopes("linked", entity="member")
         members = {0}
         for scope in scopes:
             value = scope.split(":", 1)[-1]
@@ -87,6 +88,8 @@ class ActivityLog:
         return {"accounts": [await self.status(member) for member in sorted(members)]}
 
     async def complete_activity(self, member, job, outcome):
+        if job["path"] == "/scrobble/start":
+            return
         try:
             rows = await self.get(member, "activity", [])
             previous = next((row for row in rows if row["id"] == job["id"]), {})
@@ -97,10 +100,12 @@ class ActivityLog:
                 job["id"],
                 **metadata,
                 occurred_at=job["occurred_at"],
-                state="skipped" if outcome == "expired" else "sent",
+                state="skipped" if outcome in ("expired", "local_deleted", "dismissed") else "sent",
                 completed_at=iso_time(self.clock()),
                 reason={
                     "expired": "实时播放事件已过期，不补报正在观看",
+                    "local_deleted": "本地条目或文件已删除，已停止此条同步；不删除 Trakt 历史",
+                    "dismissed": "用户已忽略此条记录，未补传也未删除 Trakt 历史",
                     "ignored_short_play": "已清除正在观看；短播放未记入已看历史",
                     "already_synced": "已确认 Trakt 中存在记录，未重复添加",
                 }.get(outcome),
@@ -109,16 +114,24 @@ class ActivityLog:
             self.log.warning("Trakt 发送详情暂未保存，投递队列不受影响")
 
     async def activity(self, member):
-        ledger = await self.ledger(member)
-        history = await self.get(member, "activity", [])
+        try:
+            ledger = await self.ledger(member)
+            history = await self.get(member, "activity", [])
+        except ValueError:
+            return {"member_id": member, "records": [], "retained": 80}
         by_id = {row["id"]: row for row in history}
         live = []
-        for state, jobs in (("queued", ledger["queue"]), ("failed", ledger.get("failed", []))):
+        for state, jobs in (
+            ("queued", ledger["queue"]),
+            ("failed", ledger.get("failed", [])),
+        ):
             for job in jobs:
+                if job["path"] == "/scrobble/start":
+                    continue
                 code = job.get("error_status")
                 visible_state = state
                 if state == "queued" and code is not None:
-                    visible_state = "blocked" if code in (400, 401, 403) else "retrying"
+                    visible_state = "blocked" if self.auth_failed(job) else "retrying"
                 live.append(
                     {
                         **fallback(job),
@@ -127,12 +140,17 @@ class ActivityLog:
                         "state": visible_state,
                         "occurred_at": job["occurred_at"],
                         "error_status": code,
-                        "reason": error_reason(code)
+                        "reason": job.get("repair_reason") or error_reason(code)
                         if code is not None
                         else ("影片匹配失败，请检查外部编号后重试" if state == "failed" else None),
-                        "retry_at": iso_time(job["next_at"]) if state == "queued" else None,
+                        "retry_at": iso_time(
+                            job["next_at"]
+                            if state == "queued"
+                            else job.get("retry_at", self.clock() + 600)
+                        ),
                         "failures": job.get("attempt", 0),
                         "can_retry": state == "failed",
+                        "can_repair": state == "failed" and "episode" in job.get("item", {}),
                     }
                 )
         tasks = (await self.store.scopes("task", entity="transfer")).values()
@@ -167,7 +185,9 @@ class ActivityLog:
         finished = [
             row
             for row in history
-            if row["id"] not in live_ids and row.get("state") in ("sent", "skipped")
+            if row["id"] not in live_ids
+            and row.get("state") in ("sent", "skipped")
+            and row.get("event") not in ("started", "progress")
         ]
         rows = sorted(live + finished, key=lambda row: row.get("occurred_at", ""), reverse=True)
         return {"member_id": member, "records": rows, "retained": 80}

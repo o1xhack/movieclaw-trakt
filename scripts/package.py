@@ -22,6 +22,9 @@ def build(output):
             "docs/sync-workflow.zh-CN.md",
             "LICENSE",
             "PRIVACY.md",
+            "APPLICATION.md",
+            "SOURCE.md",
+            "CHANGELOG.md",
         )
     ]
     files += sorted((ROOT / "trakt_sync").glob("*.py"))

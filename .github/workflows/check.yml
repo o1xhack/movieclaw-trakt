@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: movieclaw/MovieClaw
-          ref: v0.41.0
+          ref: fae7ec10bf6aef8b12c819134930014fbe01d5cb # v0.43.0
           path: .sdk
       - uses: actions/setup-python@v5
         with:
@@ -34,8 +34,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: o1xhack/movieclaw
-          ref: fa86474e596d7e9383a15e3b95088ea3c4f9e35c # companion history API proposal
+          repository: movieclaw/MovieClaw
+          ref: fae7ec10bf6aef8b12c819134930014fbe01d5cb # released v0.43.0
           path: .sdk
       - uses: actions/setup-python@v5
         with:

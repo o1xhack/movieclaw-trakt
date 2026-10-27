@@ -1,5 +1,6 @@
 """Real host SQLite + HostOps HTTP gateway + plugin routes. Only Trakt is mocked."""
 
+import asyncio
 import importlib
 import json
 import os
@@ -8,7 +9,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from conftest import Health, Store
+
+from .conftest import Health, Store
 
 pytestmark = pytest.mark.skipif(
     os.getenv("MOVIECLAW_HOST_QA") != "1", reason="isolated host integration"
@@ -19,13 +21,15 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
     from fastapi.testclient import TestClient
     from movieclaw_api.core.config import get_settings
     from movieclaw_api.plugins.keys import PLUGIN_DATA, PLUGIN_HEALTH, PLUGIN_ROUTES
-    from movieclaw_api.services.auth import reset_auth_state
+    from movieclaw_api.services.auth import issue_member_session_token, reset_auth_state
+    from movieclaw_api.services.durable_events import DurableEvents
     from movieclaw_api.services.host_ops import HostOps
     from movieclaw_api.services.plugin_routes import PluginRoutes
     from movieclaw_api.settings.store import reset_setting_store
     from movieclaw_db.crypto import reset_secret_box
     from movieclaw_db.engine import get_database
     from movieclaw_db.models import (
+        EventConsumer,
         FileSource,
         FileState,
         LibraryFile,
@@ -61,7 +65,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
     app = create_app()
     entry = importlib.import_module("trakt_sync.plugin")
     store, engines, requests = Store(), [], []
-    real_events = []
+    episode_rows = []
 
     class QuietEngine(Engine):
         def __init__(self, *args, **kwargs):
@@ -86,7 +90,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                 headers={"X-Pagination-Page-Count": "1"},
             )
         if r.method == "GET" and r.url.path == "/sync/history/episodes":
-            return httpx.Response(200, json=[], headers={"X-Pagination-Page-Count": "1"})
+            return httpx.Response(200, json=episode_rows, headers={"X-Pagination-Page-Count": "1"})
         return httpx.Response(201, json={"added": {"movies": 1}})
 
     monkeypatch.setattr(entry, "Engine", QuietEngine)
@@ -128,7 +132,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
             )
             await s.commit()
         ops = HostOps(app)
-        ops.configure("trakt-sync", grants=["playback.sync.catalog", "playback.sync.import"])
+        ops.configure("trakt-sync", grants=list(entry.apply.permissions))
         # The host has its own live kernel; the harness leak scan is process-wide.
         async with KernelHarness(strict=False) as h:
             h.provide(PLUGIN_DATA, SimpleNamespace(scoped=lambda _: store))
@@ -136,13 +140,18 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
             h.provide(PLUGIN_ROUTES, PluginRoutes(app, lambda _: store))
             h.provide(HOST_OPS, ops)
 
-            def subscribe(event, **kwargs):
-                real_events.append(event)
-                return lambda: None
-
-            h.provide(DURABLE_EVENTS, SimpleNamespace(subscribe=subscribe))
+            events = DurableEvents(get_database())
+            h.provide(DURABLE_EVENTS, events)
             fiber = await h.mount(entry.apply)
             assert fiber.state.value == "active"
+            for _ in range(100):
+                async with get_database().session() as s:
+                    consumers = list((await s.execute(select(EventConsumer))).scalars())
+                if len([v for v in consumers if v.consumer_id.startswith("trakt-sync:")]) == 6:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("durable consumers did not register")
             e = engines[0]
             await e.set(
                 2,
@@ -194,6 +203,9 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                 assert task["done"] == 3 and task["state"] == "complete", task
                 async with get_database().session() as s:
                     facts = list((await s.execute(select(WatchRecord))).scalars())
+                    assert sorted(v.watched_at for v in facts) == [
+                        datetime(2020, 1, i, 11) for i in (1, 2, 3)
+                    ]
                     assert len(facts) == 3 and all(
                         v.member_id == 2 and v.source == "plugin:trakt-sync" for v in facts
                     )
@@ -287,8 +299,113 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     "2020-01-02",
                     "2020-01-03",
                 }
+                assert not await store.scopes("task", entity="transfer")
+                # Real member cookie -> marks API -> durable SQLite event -> plugin -> Trakt.
+                prefs = {"manual_watched": True, "manual_unwatched": True, "favorites": True}
+                response = await web.put(
+                    "/api/v1/plugins/trakt-sync/profile?member_id=2", json=prefs
+                )
+                assert response.status_code == 200, response.text
+                async with get_database().session() as s:
+                    member = await s.get(Member, 2)
+                    member_session, _ = await issue_member_session_token(member)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app), base_url="http://fixture"
+                ) as member_web:
+                    member_web.cookies.set("movieclaw_session", member_session)
+                    assert (
+                        await member_web.get("/api/v1/plugins/trakt-sync/profile")
+                    ).status_code == 403
+                    for change, expected in [
+                        ({"played": True}, "/sync/history"),
+                        ({"played": False}, "/sync/history/remove"),
+                        ({"favorite": True}, "/sync/watchlist"),
+                    ]:
+                        before = len(requests)
+                        response = await member_web.post(
+                            "/api/v1/playback/marks", json={"media_item_id": corrected_id, **change}
+                        )
+                        assert response.status_code == 200, response.text
+                        for _ in range(250):
+                            tasks = list((await store.scopes("task", entity="transfer")).values())
+                            if (
+                                tasks
+                                and all(v["state"] == "complete" for v in tasks)
+                                and any(
+                                    r.method == "POST" and r.url.path == expected
+                                    for r in requests[before:]
+                                )
+                            ):
+                                break
+                            await asyncio.sleep(0.02)
+                        else:
+                            raise AssertionError(tasks)
+                        assert all(v["member_id"] == 2 for v in tasks)
+                        assert all(r.headers["Authorization"] == "Bearer fixture" for r in requests)
+                # Episode rewatches preserve the exact second, independently of season sentinels.
+                async with get_database().session() as s:
+                    show = MediaItem(
+                        kind="tv", title="Series", original_title="Series", tmdb_id=200
+                    )
+                    s.add(show)
+                    await s.flush()
+                    s.add(
+                        LibraryFile(
+                            library_id=library.id,
+                            media_item_id=show.id,
+                            season_number=1,
+                            episode_number=2,
+                            file_path=str(tmp_path / "s1e2.mkv"),
+                            size_bytes=1,
+                            source=FileSource.SCANNED,
+                            state=FileState.IN_PLACE,
+                        )
+                    )
+                    await s.commit()
+                    show_id = show.id
+                for i, when in enumerate(["2021-02-03T04:05:06Z", "2021-02-04T05:06:07Z"]):
+                    episode_rows.append(
+                        {
+                            "id": 100 + i,
+                            "watched_at": when,
+                            "show": {"ids": {"tmdb": 200}},
+                            "episode": {"season": 1, "number": 2},
+                        }
+                    )
+                imported = await call("", "POST", {"direction": "import"})
+                for _ in range(10):
+                    imported = await call(f"/{imported['id']}/tick", "POST")
+                    if imported["state"] == "ready":
+                        break
+                assert imported["total"] == 2 and imported["episodes"] == 1
+                await call(
+                    f"/{imported['id']}/confirm", "POST", {"token": imported["preview_token"]}
+                )
+                for _ in range(10):
+                    imported = await call(f"/{imported['id']}/tick", "POST")
+                    if imported["state"] == "complete":
+                        break
+                assert imported["done"] == 2
+                async with get_database().session() as s:
+                    watches = list(
+                        (
+                            await s.execute(
+                                select(WatchRecord).where(WatchRecord.media_item_id == show_id)
+                            )
+                        ).scalars()
+                    )
+                    assert sorted(w.watched_at for w in watches) == [
+                        datetime(2021, 2, 3, 4, 5, 6),
+                        datetime(2021, 2, 4, 5, 6, 7),
+                    ]
+                    assert all(
+                        w.season_number == 1 and w.episode_number == 2 and w.member_id == 2
+                        for w in watches
+                    )
+                    assert not list((await s.execute(select(PlaybackLog))).scalars())
+                assert len(await store.scopes("task", entity="transfer")) == 3
             await h.unmount(fiber)
-            import asyncio
+            await events.close()
 
             assert not [
                 t

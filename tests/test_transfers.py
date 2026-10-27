@@ -394,3 +394,65 @@ async def test_reconnecting_same_account_keeps_fresh_preview_version(harness):
     await t.confirm(0, task["id"], task["preview_token"])
     task = await drive(t, task, "complete", clock)
     assert len(ops.writes) == 4 and task["done"] == 4
+
+
+@pytest.mark.parametrize("oauth", [False, True])
+async def test_trakt_auth_failure_blocks_account_and_pauses_other_transfer(harness, oauth):
+    from trakt_sync.client import TraktError
+
+    e, _, _, _ = await harness()
+    ops = Ops([unit()])
+    t = Transfers(e, ops)
+    task = await t.create(0, "export")
+
+    async def rejected(*args, **kwargs):
+        raise TraktError(400 if oauth else 403, auth_error=oauth)
+
+    t.request = rejected
+    task = await t.get(0, task["id"])
+    task["phase"] = "remote"
+    await t.save(task)
+    # An import scan uses the same authenticated request path.
+    task["direction"] = "import"
+    await t.save(task)
+    result = await t.step(task["id"], 0)
+    assert result["state"] == "paused"
+    assert (await e.status(0))["needs_reconnect"]
+    await t.control(0, task["id"], "resume")
+    result = await t.step(task["id"], 0)
+    assert result["state"] == "paused" and "Trakt" in result["error"]
+
+
+async def test_host_permission_failure_does_not_revoke_trakt_account(harness):
+    from movieclaw_sdk.ops import OpsError
+
+    e, _, _, requests = await harness()
+    ops = Ops([unit()])
+
+    async def forbidden(*args, **kwargs):
+        raise OpsError(403, "FORBIDDEN", "fixture missing host grant")
+
+    ops.call = forbidden
+    t = Transfers(e, ops)
+    task = await t.create(0, "export")
+    result = await t.step(task["id"], 0)
+    assert result["state"] == "paused" and "操作授权" in result["error"]
+    assert (await e.status(0))["connected"] and not requests
+
+
+async def test_export_item_400_does_not_abort_other_rows(harness):
+    def handler(r):
+        if r.method == "POST" and json.loads(r.content)["movies"][0]["ids"]["tmdb"] == 1:
+            return httpx.Response(400)
+        if r.method == "POST":
+            return httpx.Response(201, json={"added": {"movies": 1}})
+
+    e, _, _, _ = await harness(handler)
+    t = Transfers(e, Ops([unit(), unit(2)]))
+    task = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, task["id"], task["preview_token"])
+    await t.step(task["id"], 0)
+    result = await t.step(task["id"], 0)
+    assert result["state"] == "complete_with_errors"
+    assert result["done"] == 1 and result["failed"] == 1
+    assert (await e.status(0))["connected"]

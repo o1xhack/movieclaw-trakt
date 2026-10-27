@@ -10,7 +10,7 @@ from trakt_sync.policy import iso_time
 async def test_account_overview_does_not_expose_credentials(harness):
     e, store, _, _ = await harness()
     account = await e.get(0, "account")
-    await store.set("account", {**account, "username": "other-user"}, scope="member:3", secret=True)
+    await e.set(3, "account", {**account, "username": "other-user"}, secret=True)
     result = await e.accounts()
     assert [a["member_id"] for a in result["accounts"]] == [0, 3]
     assert result["accounts"][1]["username"] == "other-user"
@@ -53,11 +53,15 @@ async def test_failures_show_exact_media_reason_and_retry_time(harness, event, c
         iso_time(clock[0]),
     )
     await e.drain(0)
+    if code == 403:
+        assert (await e.status(0))["needs_reconnect"]
+        assert (await e.activity(0))["records"] == []
+        return
     row = (await e.activity(0))["records"][0]
     assert row["state"] == state and row["title"] == "测试影片"
     assert row["error_status"] == code and row["reason"]
     assert row["can_retry"] == (state == "failed")
-    assert bool(row["retry_at"]) == (state != "failed")
+    assert row["retry_at"]
 
 
 async def test_single_retry_does_not_retry_other_members_or_other_failures(harness, event):
@@ -87,7 +91,7 @@ async def test_coalesced_progress_is_not_shown_as_a_phantom_pending_job(harness,
     await e.accept("started", event, "start", iso_time(clock[0]))
     clock[0] += 61
     await e.accept("progress", event, "progress", iso_time(clock[0]))
-    assert [r["id"] for r in (await e.activity(0))["records"]] == ["progress"]
+    assert (await e.activity(0))["records"] == []
 
 
 async def test_legacy_queued_failures_remain_inspectable_without_title(harness, event):
@@ -131,7 +135,7 @@ async def test_activity_storage_failure_cannot_break_delivery(harness, event):
 async def test_missing_media_id_is_visible_as_skipped_without_sending(harness, event):
     e, _, clock, requests = await harness()
     await e.accept(
-        "started",
+        "completed",
         {**event, "media": {"id": 1, "kind": "movie", "title": "没有编号"}},
         "skip",
         iso_time(clock[0]),
@@ -160,4 +164,4 @@ async def test_playback_noise_cannot_evict_watched_and_favorite_records(harness)
         )
     rows = (await e.activity(0))["records"]
     assert {"manual", "favorite"}.issubset({r["id"] for r in rows})
-    assert len(rows) == 22
+    assert len(rows) == 2  # Heartbeats are hidden; important records remain.

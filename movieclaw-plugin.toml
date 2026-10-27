@@ -1,7 +1,7 @@
 [plugin]
 id = "trakt-sync"
 title = "Trakt 自动追踪"
-version = "0.3.0-beta.1"
+version = "0.3.0-beta.2"
 entry = "trakt_sync"
 runtime = "process"
 sdk = "^1.0"
@@ -23,5 +23,5 @@ description = "将 MovieClaw 播放活动自动同步到各成员绑定的 Trakt
 
 [permissions]
 network = true
-operations = ["playback.sync.catalog", "playback.sync.import"]
+operations = ["library.list", "library.items.get", "playback.sync.catalog", "playback.sync.import"]
 events = ["playback.started", "playback.progress", "playback.stopped", "playback.completed", "playback.marked_played", "playback.marked_unplayed", "library.item.favorited"]

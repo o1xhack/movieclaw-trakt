@@ -606,3 +606,6 @@ progress { width:100%; accent-color:var(--accent); margin:12px 0 }
 #history .card button + button { margin-left:8px }
 #detail { width:min(760px, calc(100vw - 32px)); max-height:85vh; overflow:auto }
 #detail-items { margin:16px 0 }
+
+.repair-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }
+.repair-controls input { width:72px; min-height:44px; }

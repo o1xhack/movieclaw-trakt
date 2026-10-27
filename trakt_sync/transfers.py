@@ -107,6 +107,8 @@ class Transfers:
         account = await self.e.get(task["member_id"], "account", {})
         if account.get("generation") != task["generation"]:
             raise ValueError("账号连接已变化，请取消后重新扫描")
+        if account.get("blocked") or account.get("client_id") != self.e.client.client_id:
+            raise ValueError("Trakt 授权失效，请重新连接")
         return await self.e.authorized(task["member_id"], account, method, path, body, params)
 
     async def receipt(self, task, row, write=False):
@@ -479,7 +481,7 @@ class Transfers:
             try:
                 await self.execute_row(task, row, key, rows)
             except TraktError as exc:
-                if exc.status not in {404, 422}:
+                if exc.auth_error or exc.status not in {400, 404, 422}:
                     raise
                 row.update(state="failed", reason=str(exc))
             await self.store.set(key, rows, scope=self.scope(task))
@@ -527,6 +529,8 @@ class Transfers:
                 task.update(state="paused", error="插件已停用")
             elif (await self.e.get(member, "account", {})).get("generation") != task["generation"]:
                 task.update(state="cancelled", error="账号已断开或更换")
+            elif not (await self.e.status(member))["connected"]:
+                task.update(state="paused", error="Trakt 授权失效，请重新连接")
             else:
                 checkpoint = copy.deepcopy(task)
                 try:
@@ -544,13 +548,19 @@ class Transfers:
                     task = checkpoint
                     task["attempt"] += 1
                     code = getattr(exc, "status", 0)
+                    auth_error = isinstance(exc, TraktError) and exc.auth_error
                     task["error"] = (
-                        "授权或接口不可用，请检查兼容版本和操作授权"
+                        "Trakt 授权失效，请重新连接"
+                        if auth_error
+                        else "同步接口不可用，请检查兼容版本和操作授权"
                         if code in {400, 401, 403, 404, 422}
                         else "连接暂未完成，保持网页打开后重试"
                     )
                     if code in {400, 401, 403, 404, 422}:
                         task["state"] = "paused"
+                    if auth_error:
+                        account = await self.e.get(member, "account", {})
+                        await self.e.block_auth(member, account, await self.e.ledger(member))
                     task["next_at"] = self.e.clock() + max(
                         getattr(exc, "retry_after", 5), min(3600, 5 * 2 ** min(task["attempt"], 10))
                     )

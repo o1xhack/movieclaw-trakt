@@ -17,6 +17,64 @@ async def drive(t, member, task_id, target, limit=1000):
     raise AssertionError(await t.get(member, task_id))
 
 
+async def test_item_400_is_terminal_and_does_not_block_later_actions(harness, event):
+    rejected = [True]
+
+    def handler(request):
+        if request.method == "POST" and request.url.path == "/sync/history" and rejected[0]:
+            return httpx.Response(400)
+
+    e, store, clock, requests = await harness(handler)
+    await e.set(0, "profile", Preferences(manual_watched=True).model_dump())
+    a = Actions(e)
+    await a.automatic("marked_played", event, "bad", iso_time(clock[0]))
+    first = next(iter((await store.scopes("task", entity="transfer")).values()))
+    await a.step(first["id"], 0)
+    task = await a.get(0, first["id"])
+    assert task["state"] == "running" and not task.get("error")
+    await a.step(first["id"], 0)
+    assert (await a.get(0, first["id"]))["state"] == "complete_with_errors"
+    assert (await e.status(0))["connected"]
+    rejected[0] = False
+    await a.automatic("marked_played", event, "good", iso_time(clock[0]))
+    await a.drain_once()
+    assert sum(r.method == "POST" and r.url.path == "/sync/history" for r in requests) == 2
+
+
+async def test_action_auth_rejection_blocks_new_events_without_losing_other_members(harness, event):
+    e, store, clock, requests = await harness(
+        lambda r: httpx.Response(403) if r.headers["Authorization"] != "Bearer member-two" else None
+    )
+    await e.set(0, "profile", Preferences(favorites=True).model_dump())
+    a = Actions(e)
+    await a.automatic("favorited", {**event, "level": "movie"}, "auth-bad", iso_time(clock[0]))
+    task = next(iter((await store.scopes("task", entity="transfer")).values()))
+    await a.step(task["id"], 0)
+    assert (await e.status(0))["needs_reconnect"]
+    for n in range(70):
+        await a.automatic("favorited", {**event, "level": "movie"}, f"auth-{n}", iso_time(clock[0]))
+    assert len(await store.scopes("task", entity="transfer")) == 1
+    assert len(requests) == 1
+    await e.set(2, "profile", Preferences(favorites=True).model_dump())
+    await e.set(
+        2,
+        "account",
+        {
+            **await e.get(0, "account"),
+            "blocked": False,
+            "access_token": "member-two",
+            "generation": "two",
+        },
+        secret=True,
+    )
+    await a.automatic(
+        "favorited", {**event, "member_id": 2, "level": "movie"}, "two", iso_time(clock[0])
+    )
+    await a.drain_once()
+    assert len(requests) == 2 and requests[-1].headers["Authorization"] == "Bearer member-two"
+    assert (await e.status(2))["connected"]
+
+
 async def test_manual_opt_in_per_member_duplicates_unwatch_and_favorite(harness, event):
     e, _, clock, requests = await harness()
     t = Actions(e)

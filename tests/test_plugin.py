@@ -2,10 +2,10 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from conftest import Health, Store
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from movieclaw_api.api.deps import require_login
@@ -23,6 +23,8 @@ from trakt_sync.application import DEFAULT_CLIENT_ID
 from trakt_sync.engine import Engine
 from trakt_sync.plugin import apply
 from trakt_sync.policy import iso_time
+
+from .conftest import Health, Store
 
 
 @pytest.mark.parametrize(
@@ -123,7 +125,7 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
         h.provide(PLUGIN_ROUTES, routes)
 
         async def ops_client(ctx):
-            return SimpleNamespace()
+            return SimpleNamespace(call=AsyncMock(return_value=[]))
 
         h.provide(HOST_OPS, SimpleNamespace(client=ops_client))
         h.provide(DURABLE_EVENTS, SimpleNamespace(subscribe=subscribe))
