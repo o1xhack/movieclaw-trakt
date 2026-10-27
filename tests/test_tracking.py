@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from trakt_sync.engine import Engine
-from trakt_sync.policy import identity, iso_time, progress
+from trakt_sync.policy import identity, iso_time, progress, timestamp
 
 
 @pytest.mark.parametrize(
@@ -409,7 +409,7 @@ async def test_previously_played_flag_does_not_finish_early_rewatch(harness, eve
     assert json.loads(requests[0].content)["progress"] == 0
 
 
-async def test_recent_local_completion_always_uses_original_time(harness, event):
+async def test_recent_local_completion_keeps_source_time_and_sends_trakt_minute(harness, event):
     e, _, clock, requests = await harness()
     when = iso_time(clock[0] - 30)
     await e.accept(
@@ -420,7 +420,10 @@ async def test_recent_local_completion_always_uses_original_time(harness, event)
     )
     await e.drain(0)
     assert [r.url.path for r in requests] == ["/sync/history/movies", "/sync/history"]
-    assert json.loads(requests[-1].content)["movies"][0]["watched_at"] == when
+    assert json.loads(requests[-1].content)["movies"][0]["watched_at"] == iso_time(
+        timestamp(when) // 60 * 60
+    )
+    assert (await e.activity(0))["records"][0]["occurred_at"] == when
 
 
 async def test_local_completion_clears_matching_watching_then_adds_history_once(harness, event):

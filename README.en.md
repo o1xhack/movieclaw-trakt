@@ -25,10 +25,10 @@ Free Trakt accounts currently allow two Community Apps, excluding official Trakt
 - Show bounded delivery details and retry matching failures. Start/progress heartbeats do not fill the activity list.
 - Only clients reporting playback to MovieClaw are tracked. Infuse playing independently through Plex bypasses this plugin.
 - Three independent, default-off member preferences: manual watched, manual unwatched, and new favorites to Trakt Watchlist. Unwatched removes all Trakt watches for that movie/episode, including rewatches. Unfavorite does not remove Watchlist entries; ratings are absent.
-- Manual, foreground-only history export/import: scan, review full movie/per-season groups, Confirm, then batched progress. Hiding/closing the page stops new batches; resuming is explicit. Preserve original movie/episode timestamps and rewatches, matched only to local holdings.
+- Manual, foreground-only history export/import: scan, review full movie/per-season groups, Confirm, then batched progress. Hiding/closing the page stops new batches; resuming is explicit. Trakt stores UTC minutes: export floors the remote timestamp without changing local seconds/microseconds, and import preserves the actual API-returned time. Rewatches in different minutes remain distinct; extra same-minute source watches are disclosed and skipped. Match only local holdings.
 - A separate History page loads batch summaries first and details on demand. Durable receipts and activity/inventory checks support incremental reconciliation; playback progress and media files are not imported.
 
-The candidate targets the released v0.43.0 catalog/import host operations without host patches or new ports. See the [detailed workflow](docs/sync-workflow.zh-CN.md).
+The candidate targets the released v0.43.0 catalog/import host operations without host patches or new ports. See the [detailed workflow](docs/sync-workflow.zh-CN.md) and [minute precision contract](docs/trakt-time-contract.zh-CN.md), based on [Trakt announcement #694](https://github.com/trakt/trakt-api/discussions/694). Lost remote seconds cannot be reconstructed.
 
 Offline support is limited to events the host actually emits. Missing rewatches or historical completion events cannot be reconstructed. This version does not promise a usable `viewing_id` or complete per-offline-viewing history. The app must run again and reconnect; a full iPhone airplane-mode/playback/reconnection test remains pending.
 

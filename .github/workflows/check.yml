@@ -20,7 +20,7 @@ jobs:
       - run: python -m pytest -q
         env:
           PYTHONPATH: .sdk/src
-      - run: node --test tests/web.test.cjs
+      - run: node --test tests/*web.test.cjs
       - run: node --check web/app.js
       - run: node --check web/history.js
       - run: python scripts/package.py

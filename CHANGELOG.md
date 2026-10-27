@@ -2,6 +2,7 @@
 
 ## 0.3.0-beta.2 (unreleased)
 
+- Follow Trakt #694 UTC minute precision for history writes and deduplication; reconcile lost responses without confusing adjacent minutes. Keep local seconds/microseconds and event ordering intact. Disclose and skip extra same-minute watches rather than claiming lossless export; imported timestamps retain only precision actually returned by Trakt.
 - Integrate all stable 0.2.3 authentication, queue-capacity, metadata recovery and UI repairs into the separate dev track.
 - Target released MovieClaw v0.43.0 for catalog/import APIs and CI; keep marketplace automation disabled.
 - Add three independent default-off member preferences, activity filters and confirmed foreground history import/export with original movie/episode dates, rewatches, grouped previews and durable incremental receipts. No ratings, member self-service or background bulk transfer.

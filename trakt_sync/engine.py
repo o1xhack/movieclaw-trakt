@@ -19,6 +19,7 @@ from .policy import (
     progress,
     session_key,
     timestamp,
+    trakt_minute,
 )
 from .recovery import LocalStateError, Recovery
 
@@ -654,7 +655,7 @@ class Engine(ActivityLog, Recovery):
         return updated
 
     async def history_exists(self, member, account, job):
-        when = timestamp(job["occurred_at"])
+        when = trakt_minute(job["occurred_at"])
         kind = "movies" if "movie" in job["item"] else "episodes"
         page = 1
         previous = None
@@ -665,14 +666,14 @@ class Engine(ActivityLog, Recovery):
                 "GET",
                 f"/sync/history/{kind}",
                 params={
-                    "start_at": iso_time(when - 90),
-                    "end_at": iso_time(when + 90),
+                    "start_at": iso_time(when),
+                    "end_at": iso_time(when + 60),
                     "limit": 100,
                     "page": page,
                 },
             )
             for row in rows:
-                if matches(job["item"], row) and abs(timestamp(row["watched_at"]) - when) <= 60:
+                if matches(job["item"], row) and trakt_minute(row["watched_at"]) == when:
                     return True
             if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
                 return False

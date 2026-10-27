@@ -21,6 +21,7 @@ from movieclaw_kernel.testing import KernelHarness
 from movieclaw_sdk.ops import HOST_OPS
 
 from tests.conftest import Health, Store
+from tests.test_trakt_minutes import MinuteService
 from tests.test_transfers import Ops, unit
 
 
@@ -28,12 +29,20 @@ async def main():
     app, store, remote_writes = FastAPI(), Store(), []
     entry = importlib.import_module("trakt_sync.plugin")
     inventory = [unit(watches=3)] + [unit(2, "tv", 1, e) for e in range(1, 13)]
+    inventory[0]["watches"][0]["watched_at"] = "2020-01-01T00:00:10.100Z"
+    inventory[0]["watches"].append(
+        {"id": "same-minute-extra", "watched_at": "2020-01-01T00:00:55.900Z", "basis": "playback"}
+    )
     ops = Ops(inventory)
+    services = {}
 
     async def dispatch(r):
         await asyncio.sleep(0.1)
         if r.method == "POST":
             remote_writes.append({"path": r.url.path, "body": json.loads(r.content)})
+        if r.url.path == "/sync/history" or r.url.path.startswith("/sync/history/"):
+            return services.setdefault(r.headers.get("Authorization"), MinuteService())(r)
+        if r.method == "POST":
             return httpx.Response(201, json={"added": {"movies": 1, "episodes": 1}})
         if r.url.path == "/sync/last_activities":
             return httpx.Response(200, json={"movies": {"watched_at": "2020-01-04T00:00:00Z"}})

@@ -26,6 +26,8 @@ Trakt 是否产生观看记录依其进度阈值；不足 1% 的 stop 返回 422
 
 ## 应用与验收
 
+历史写入与不确定结果查重遵循 [Trakt UTC 分钟精度](trakt-time-contract.zh-CN.md)：远端秒／微秒归零，本地 `occurred_at` 与新旧操作排序仍保留原精度。同一分钟额外观看不能分别导出，不同分钟不能用前后 60 秒容差误合并。
+
 默认使用 MovieClaw 项目维护的公开应用，无 Secret 的设备码流程见 [APPLICATION.md](../APPLICATION.md)。源码不放 Client Secret。仅自行部署者可使用自己注册的应用覆盖配置，Secret 由宿主加密保存。换应用前断开旧连接；发现 Client ID 已不匹配时只清除本地绑定，不拿新应用的凭据去撤销旧应用。
 
 ## 在此仓库验证

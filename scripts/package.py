@@ -20,6 +20,7 @@ def build(output):
             "docs/technical-notes.zh-CN.md",
             "docs/technical-notes.en.md",
             "docs/sync-workflow.zh-CN.md",
+            "docs/trakt-time-contract.zh-CN.md",
             "LICENSE",
             "PRIVACY.md",
             "APPLICATION.md",

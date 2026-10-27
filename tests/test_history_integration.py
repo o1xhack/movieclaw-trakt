@@ -342,7 +342,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                             raise AssertionError(tasks)
                         assert all(v["member_id"] == 2 for v in tasks)
                         assert all(r.headers["Authorization"] == "Bearer fixture" for r in requests)
-                # Episode rewatches preserve the exact second, independently of season sentinels.
+                # Trakt episode rewatches arrive at minute precision, independently of season sentinels.
                 async with get_database().session() as s:
                     show = MediaItem(
                         kind="tv", title="Series", original_title="Series", tmdb_id=200
@@ -363,7 +363,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     )
                     await s.commit()
                     show_id = show.id
-                for i, when in enumerate(["2021-02-03T04:05:06Z", "2021-02-04T05:06:07Z"]):
+                for i, when in enumerate(["2021-02-03T04:05:00Z", "2021-02-04T05:06:00Z"]):
                     episode_rows.append(
                         {
                             "id": 100 + i,
@@ -395,8 +395,8 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                         ).scalars()
                     )
                     assert sorted(w.watched_at for w in watches) == [
-                        datetime(2021, 2, 3, 4, 5, 6),
-                        datetime(2021, 2, 4, 5, 6, 7),
+                        datetime(2021, 2, 3, 4, 5),
+                        datetime(2021, 2, 4, 5, 6),
                     ]
                     assert all(
                         w.season_number == 1 and w.episode_number == 2 and w.member_id == 2
@@ -404,6 +404,87 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     )
                     assert not list((await s.execute(select(PlaybackLog))).scalars())
                 assert len(await store.scopes("task", entity="transfer")) == 3
+                # Existing native history keeps its seconds/microseconds in the real host DB.
+                precise = datetime(2021, 3, 4, 5, 6, 47, 123456)
+                async with get_database().session() as s:
+                    native = MediaItem(
+                        kind="movie", title="Native precision", original_title="Native", tmdb_id=333
+                    )
+                    s.add(native)
+                    await s.flush()
+                    s.add(
+                        LibraryFile(
+                            library_id=library.id,
+                            media_item_id=native.id,
+                            file_path=str(tmp_path / "native.mkv"),
+                            size_bytes=1,
+                            source=FileSource.SCANNED,
+                            state=FileState.IN_PLACE,
+                            duration_seconds=600,
+                        )
+                    )
+                    s.add(
+                        PlaybackState(
+                            member_id=2,
+                            media_item_id=native.id,
+                            played=True,
+                            last_played_at=precise,
+                            play_count=1,
+                        )
+                    )
+                    s.add(
+                        PlaybackLog(
+                            member_id=2,
+                            media_item_id=native.id,
+                            started_at=datetime(2021, 3, 4, 4, 56),
+                            ended_at=precise,
+                            last_seen_at=precise,
+                            end_position_ms=570000,
+                            completed=True,
+                        )
+                    )
+                    await s.commit()
+                    native_id = native.id
+                native_export = await call("", "POST", {"direction": "export"})
+                for _ in range(10):
+                    native_export = await call(f"/{native_export['id']}/tick", "POST")
+                    if native_export["state"] == "ready":
+                        break
+                await call(
+                    f"/{native_export['id']}/confirm",
+                    "POST",
+                    {"token": native_export["preview_token"]},
+                )
+                for _ in range(10):
+                    native_export = await call(f"/{native_export['id']}/tick", "POST")
+                    if native_export["state"] == "complete":
+                        break
+                assert native_export["state"] == "complete"
+                native_posts = [
+                    json.loads(r.content)["movies"][0]
+                    for r in requests
+                    if r.method == "POST"
+                    and r.url.path == "/sync/history"
+                    and json.loads(r.content).get("movies", [{}])[0].get("ids", {}).get("tmdb")
+                    == 333
+                ]
+                assert (
+                    len(native_posts) == 1
+                    and native_posts[0]["watched_at"] == "2021-03-04T05:06:00Z"
+                )
+                async with get_database().session() as s:
+                    native_log = (
+                        await s.execute(
+                            select(PlaybackLog).where(PlaybackLog.media_item_id == native_id)
+                        )
+                    ).scalar_one()
+                    assert native_log.ended_at == precise
+                    native_state = (
+                        await s.execute(
+                            select(PlaybackState).where(PlaybackState.media_item_id == native_id)
+                        )
+                    ).scalar_one()
+                    assert native_state.last_played_at == precise
             await h.unmount(fiber)
             await events.close()
 

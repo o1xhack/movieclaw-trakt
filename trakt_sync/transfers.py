@@ -9,7 +9,7 @@ import uuid
 from movieclaw_sdk.ops import OpsError
 
 from .client import TraktError
-from .policy import history_body, identity, iso_time, matches, timestamp
+from .policy import history_body, identity, iso_time, matches, timestamp, trakt_minute
 
 CHUNK = 30
 ACTIVE = {"scanning", "running"}
@@ -29,6 +29,10 @@ def item(row):
 
 def fingerprint(direction, row):
     return digest([direction, item(row), row["watched_at"], row.get("source_id")])
+
+
+def minute_key(row):
+    return "minute_" + digest([item(row), trakt_minute(row["watched_at"])])
 
 
 def summary(task):
@@ -111,11 +115,11 @@ class Transfers:
             raise ValueError("Trakt 授权失效，请重新连接")
         return await self.e.authorized(task["member_id"], account, method, path, body, params)
 
-    async def receipt(self, task, row, write=False):
+    async def receipt(self, task, row, write=False, merged=False):
         scope = f"synced:{task['member_id']}-{task['generation']}"
         key = fingerprint(task["direction"], row)
         if write:
-            await self.store.set(key, True, scope=scope)
+            await self.store.set(key, "minute_merged" if merged else True, scope=scope)
         else:
             return await self.store.get(key, scope=scope, default=False)
 
@@ -159,17 +163,22 @@ class Transfers:
             if task["direction"] == "export" and unit["played"]:
                 for watch in unit["watches"]:
                     if timestamp(watch["watched_at"]) <= timestamp(task["cutoff"]):
-                        plans.append(
-                            {
-                                "media": media,
-                                "season": unit["season"],
-                                "episode": unit["episode"],
-                                "watched_at": watch["watched_at"],
-                                "source_id": watch["id"],
-                                "basis": watch["basis"],
-                                "expected_updated_at": unit["updated_at"],
-                            }
-                        )
+                        row = {
+                            "media": media,
+                            "season": unit["season"],
+                            "episode": unit["episode"],
+                            "watched_at": watch["watched_at"],
+                            "source_id": watch["id"],
+                            "basis": watch["basis"],
+                            "expected_updated_at": unit["updated_at"],
+                        }
+                        # Include already-receipted source facts when disclosing collisions
+                        # in an incremental preview. They will not be queried or pushed again.
+                        if await self.receipt(task, row) is True:
+                            await self.store.set(
+                                minute_key(row), fingerprint("export", row), scope=self.scope(task)
+                            )
+                        plans.append(row)
             task["local_stamp"] = digest(
                 [task.get("local_stamp"), media, unit["season"], unit["episode"]]
             )
@@ -289,8 +298,20 @@ class Transfers:
 
     async def ready(self, task):
         groups = {}
+        minutes = set()
+        task["minute_collisions"] = 0
         for page in range(task["plan_pages"]):
-            for row in await self.store.get(f"plan_{page}", scope=self.scope(task), default=[]):
+            rows = await self.store.get(f"plan_{page}", scope=self.scope(task), default=[])
+            for row in rows:
+                if task["direction"] == "export":
+                    row["trakt_watched_at"] = iso_time(trakt_minute(row["watched_at"]))
+                    key = digest([item(row), row["trakt_watched_at"]])
+                    owner = await self.store.get(minute_key(row), scope=self.scope(task))
+                    row["minute_collision"] = key in minutes or bool(
+                        owner and owner != fingerprint("export", row)
+                    )
+                    task["minute_collisions"] += row["minute_collision"]
+                    minutes.add(key)
                 key = row["media"]["id"], row["season"]
                 group = groups.setdefault(
                     key,
@@ -307,6 +328,8 @@ class Transfers:
                 group["state_time_records"] += row["basis"] == "state"
                 if row["media"]["kind"] == "tv" and row["episode"] not in group["episodes"]:
                     group["episodes"].append(row["episode"])
+            if task["direction"] == "export":
+                await self.store.set(f"plan_{page}", rows, scope=self.scope(task))
         values = list(groups.values())
         for at in range(0, len(values), CHUNK):
             await self.store.set(
@@ -371,22 +394,20 @@ class Transfers:
         }
 
     async def remote_has(self, task, row):
-        when, page, previous = timestamp(row["watched_at"]), 1, None
+        when, page, previous = trakt_minute(row["watched_at"]), 1, None
         while True:
             rows = await self.request(
                 task,
                 "GET",
                 "/sync/history/" + ("movies" if row["media"]["kind"] == "movie" else "episodes"),
                 params={
-                    "start_at": iso_time(when - 1),
-                    "end_at": iso_time(when + 1),
+                    "start_at": iso_time(when),
+                    "end_at": iso_time(when + 60),
                     "limit": 100,
                     "page": page,
                 },
             )
-            if any(
-                matches(item(row), r) and abs(timestamp(r["watched_at"]) - when) < 1 for r in rows
-            ):
+            if any(matches(item(row), r) and trakt_minute(r["watched_at"]) == when for r in rows):
                 return True
             if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
                 return False
@@ -396,8 +417,17 @@ class Transfers:
             previous, page = signature, page + 1
 
     async def execute_row(self, task, row, key, rows):
-        if await self.receipt(task, row):
-            row["state"] = "sent"
+        saved = await self.receipt(task, row)
+        if saved:
+            row["state"] = "skipped" if saved == "minute_merged" else "sent"
+            if saved == "minute_merged":
+                row["reason"] = "Trakt 按分钟合并，同一分钟的额外观看无法单独保存"
+            elif task["direction"] == "export" and not await self.store.get(
+                minute_key(row), scope=self.scope(task)
+            ):
+                await self.store.set(
+                    minute_key(row), fingerprint("export", row), scope=self.scope(task)
+                )
             return
         if task["direction"] == "import":
             version = await self.store.get(
@@ -458,7 +488,17 @@ class Transfers:
             ):
                 row.update(state="skipped", reason="扫描后本地观看状态已变化")
                 return
-            if not await self.remote_has(task, row):
+            exists = await self.remote_has(task, row)
+            owner = await self.store.get(minute_key(row), scope=self.scope(task))
+            if exists and owner and owner != fingerprint("export", row):
+                row.update(
+                    state="skipped",
+                    uncertain=False,
+                    reason="Trakt 按分钟合并，同一分钟的额外观看无法单独保存",
+                )
+                await self.receipt(task, row, write=True, merged=True)
+                return
+            if not exists:
                 # Persist intent before POST: an interrupted response is checked remotely on resume.
                 row["uncertain"] = True
                 await self.store.set(key, rows, scope=self.scope(task))
@@ -469,6 +509,9 @@ class Transfers:
                     raise TraktError(502, uncertain=True)
                 if any(result.get("not_found", {}).values()):
                     raise TraktError(422)
+            await self.store.set(
+                minute_key(row), fingerprint("export", row), scope=self.scope(task)
+            )
         await self.receipt(task, row, write=True)
         row.update(state="sent", uncertain=False)
 
