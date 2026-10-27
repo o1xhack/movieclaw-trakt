@@ -331,11 +331,31 @@ class Transfers:
                 raise ValueError("预览已失效，请重新核对后确认")
             if account.get("generation") != task["generation"]:
                 raise ValueError("账号已变化，请取消后重新扫描")
+            if not self.e.enabled or not (await self.e.status(member))["connected"]:
+                raise ValueError("插件已停用或 Trakt 连接不可用，请检查账号后重新确认")
+            if task["next_at"] > self.e.clock():
+                raise ValueError("Trakt 尚在退避等待，请稍后重新确认")
             if task["direction"] == "import" and task["total"]:
-                stamp = self.watched_stamp(await self.request(task, "GET", "/sync/last_activities"))
+                try:
+                    stamp = self.watched_stamp(
+                        await self.request(task, "GET", "/sync/last_activities")
+                    )
+                except TraktError as exc:
+                    if exc.auth_error:
+                        await self.e.block_auth(member, account, await self.e.ledger(member))
+                        task.update(error="Trakt 授权失效，请重新连接", next_at=0)
+                    else:
+                        task.update(
+                            error="Trakt 暂不可用，预览已保留，请稍后重新确认",
+                            next_at=self.e.clock() + max(5, exc.retry_after),
+                        )
+                    await self.save(task)
+                    raise ValueError(task["error"]) from None
                 if stamp != task["remote_stamp"]:
                     raise ValueError("Trakt 历史已变化，请取消后重新扫描")
-            task.update(state="running", confirmed_at=iso_time(self.e.clock()), next_at=0)
+            task.update(
+                state="running", confirmed_at=iso_time(self.e.clock()), next_at=0, error=None
+            )
             task.pop("preview_token", None)
             await self.save(task)
             return summary(task)

@@ -456,3 +456,40 @@ async def test_export_item_400_does_not_abort_other_rows(harness):
     assert result["state"] == "complete_with_errors"
     assert result["done"] == 1 and result["failed"] == 1
     assert (await e.status(0))["connected"]
+
+
+@pytest.mark.parametrize("status", [403, 429, 503])
+async def test_confirmation_remote_failure_retains_preview_and_honors_retry_after(harness, status):
+    rejected = [False]
+
+    def handler(r):
+        if r.url.path == "/sync/last_activities":
+            if rejected[0]:
+                return httpx.Response(status, headers={"Retry-After": "120"})
+            return httpx.Response(200, json={"movies": {"watched_at": "2020-01-01T00:00:00Z"}})
+        if r.url.path == "/sync/history/movies":
+            return httpx.Response(200, json=[remote(1)], headers={"X-Pagination-Page-Count": "1"})
+
+    e, _, clock, requests = await harness(handler)
+    ops = Ops([unit(played=False)])
+    t = Transfers(e, ops)
+    task = await drive(t, await t.create(0, "import"), "ready")
+    rejected[0] = True
+    with pytest.raises(ValueError):
+        await t.confirm(0, task["id"], task["preview_token"])
+    retained = await t.get(0, task["id"])
+    assert not retained.get("confirmed_at") and not ops.writes
+    assert retained["preview_token"] == task["preview_token"]
+    assert (await e.status(0))["needs_reconnect"] == (status == 403)
+    if status == 403:
+        assert retained["state"] == "ready"
+    else:
+        assert retained["state"] == "ready" and retained["next_at"] >= clock[0] + 120
+        count = len(requests)
+        with pytest.raises(ValueError):
+            await t.confirm(0, task["id"], task["preview_token"])
+        assert len(requests) == count
+        rejected[0] = False
+        clock[0] = retained["next_at"] + 1
+        assert (await t.confirm(0, task["id"], task["preview_token"]))["state"] == "running"
+        assert not ops.writes
