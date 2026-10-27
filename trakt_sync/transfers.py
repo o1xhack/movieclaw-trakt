@@ -130,6 +130,7 @@ class Transfers:
                     item(row),
                     source_ids(row),
                     "minute_merged" if merged else "sent",
+                    export={"watched_at": row["watched_at"], "owner": key},
                 )
             await self.store.set(key, "minute_merged" if merged else True, scope=scope)
         else:
@@ -142,19 +143,31 @@ class Transfers:
                         item(row),
                         source_ids(row),
                         "minute_merged" if saved == "minute_merged" else "sent",
+                        export={"watched_at": row["watched_at"], "owner": key},
                     )
                 return saved
             delivered = (
                 await self.e.source_delivery(
-                    task["member_id"], task["generation"], item(row), source_ids(row)
+                    task["member_id"],
+                    task["generation"],
+                    item(row),
+                    source_ids(row),
+                    details=True,
                 )
                 if task["direction"] == "export"
                 else False
             )
-            if delivered == "minute_merged":
+            if delivered and delivered["state"] == "minute_merged":
                 return "minute_merged"
-            if delivered:
-                return "native"
+            if delivered and delivered["state"] == "sent":
+                if delivered.get("export"):
+                    export = delivered["export"]
+                    await self.store.set(
+                        minute_key({**row, "watched_at": export["watched_at"]}),
+                        export["owner"],
+                        scope=self.scope(task),
+                    )
+                return "source"
             return False
 
     async def add_plans(self, task, rows):
@@ -528,8 +541,20 @@ class Transfers:
             if await self.e.source_pending(task["member_id"], task["generation"], source_ids(row)):
                 row.update(state="failed", reason="同次实时播放尚未投递完成，请稍后重试此任务")
                 return
-            exists = await self.remote_has(task, row)
             owner = await self.store.get(minute_key(row), scope=self.scope(task))
+            await self.e.remember_source_delivery(
+                task["member_id"],
+                task["generation"],
+                item(row),
+                source_ids(row),
+                "export_pending",
+                export={
+                    "watched_at": row["watched_at"],
+                    "owner": fingerprint("export", row),
+                    "collision": bool(owner and owner != fingerprint("export", row)),
+                },
+            )
+            exists = await self.remote_has(task, row)
             if exists and owner and owner != fingerprint("export", row):
                 row.update(
                     state="skipped",

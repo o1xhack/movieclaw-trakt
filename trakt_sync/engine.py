@@ -131,8 +131,8 @@ class Engine(ActivityLog, Recovery):
         values = [values] if isinstance(values, str) else values or []
         return tuple(dict.fromkeys(v for v in values if isinstance(v, str) and 0 < len(v) <= 200))
 
-    async def source_delivery(self, member, generation, item, source_ids):
-        state = False
+    async def source_delivery(self, member, generation, item, source_ids, *, details=False):
+        selected = None
         for source_id in self.source_ids(source_ids):
             delivered = await self.get(member, self.source_key(generation, source_id))
             if not delivered:
@@ -144,21 +144,30 @@ class Engine(ActivityLog, Recovery):
             new_ids = item.get("movie", item.get("show"))["ids"]
             if any(old_ids[k] != new_ids[k] for k in old_ids.keys() & new_ids.keys()):
                 continue
-            state = delivered["state"]
-            if state == "sent":
-                return state
-        return state
+            priority = {"export_pending": 1, "minute_merged": 2, "sent": 3}
+            if not selected or priority[delivered["state"]] > priority[selected["state"]]:
+                selected = delivered
+        if details:
+            return selected
+        return selected["state"] if selected else False
 
-    async def remember_source_delivery(self, member, generation, item, source_ids, state="sent"):
+    async def remember_source_delivery(
+        self, member, generation, item, source_ids, state="sent", *, export=None
+    ):
         for source_id in self.source_ids(source_ids):
             key = self.source_key(generation, source_id)
-            value = {"item": item, "state": state}
             previous = await self.get(member, key)
+            same = previous and previous["item"] == item
+            value = {"item": item, "state": state}
+            if export:
+                value["export"] = export
+            elif same and previous.get("export"):
+                value["export"] = previous["export"]
             if previous == value or (
                 previous
                 and previous["item"] == item
                 and previous["state"] == "sent"
-                and state == "minute_merged"
+                and state != "sent"
             ):
                 continue
             await self.set(
@@ -737,7 +746,7 @@ class Engine(ActivityLog, Recovery):
         return updated
 
     async def history_exists(self, member, account, job):
-        when = trakt_minute(job["occurred_at"])
+        when = trakt_minute(job.get("history_at", job["occurred_at"]))
         end = when
         window = job.get("scrobble_window")
         if window and window["item"] == job["item"]:
@@ -849,6 +858,7 @@ class Engine(ActivityLog, Recovery):
                         account["generation"],
                         job["item"],
                         job.get("source", {}).get("watch_ids"),
+                        details=True,
                     )
                     if finished
                     else False
@@ -865,15 +875,23 @@ class Engine(ActivityLog, Recovery):
                     job.get("source", {}).get("media_id"),
                 ):
                     result = {"action": "manual_unwatched"}
-                elif delivered:
+                elif delivered and delivered["state"] != "export_pending":
                     result = {
                         "action": "minute_merged"
-                        if delivered == "minute_merged"
+                        if delivered["state"] == "minute_merged"
                         else "already_synced"
                     }
                 elif late and not finished:
                     result = {"action": "expired"}
                 else:
+                    if delivered and delivered["state"] == "export_pending":
+                        # An approved export may have committed before its receipt.
+                        # Adopt its explicit minute, never start a second native watch.
+                        job.pop("scrobble_window", None)
+                        job["history_at"] = delivered["export"]["watched_at"]
+                        job["export_collision"] = delivered["export"].get("collision", False)
+                        job["path"] = "/sync/history"
+                        job["body"] = history_body(job["item"], job["history_at"])
                     # 写前记录不确定状态，覆盖远端成功但本地落盘前进程退出的窗口。
                     if finished:
                         job["uncertain"] = True
@@ -884,7 +902,11 @@ class Engine(ActivityLog, Recovery):
                             return
                     if finished and (job["path"] == "/sync/history" or uncertain or late):
                         if await self.history_exists(member, account, job):
-                            result = {"action": "already_synced"}
+                            result = {
+                                "action": "minute_merged"
+                                if job.get("export_collision")
+                                else "already_synced"
+                            }
                         else:
                             if (
                                 job.get("clear_watching")
@@ -907,7 +929,9 @@ class Engine(ActivityLog, Recovery):
                             # response is lost too, reconcile its explicit source minute.
                             job.pop("scrobble_window", None)
                             job["path"] = "/sync/history"
-                            job["body"] = history_body(job["item"], job["occurred_at"])
+                            job["body"] = history_body(
+                                job["item"], job.get("history_at", job["occurred_at"])
+                            )
                             await self.save_inflight(member, ledger, job)
                             result = await self.authorized(
                                 member,
@@ -991,7 +1015,7 @@ class Engine(ActivityLog, Recovery):
                     job.get("source", {}).get("media_id"),
                     job["occurred_at"],
                 )
-                if result.get("action") in {"scrobble", "already_synced"} or (
+                if result.get("action") in {"scrobble", "already_synced", "minute_merged"} or (
                     job["path"] == "/sync/history" and isinstance(result.get("added"), dict)
                 ):
                     # Commit the source receipt before removing the queued delivery.
@@ -1000,6 +1024,8 @@ class Engine(ActivityLog, Recovery):
                         job["generation"],
                         job["item"],
                         job.get("source", {}).get("watch_ids"),
+                        "minute_merged" if result.get("action") == "minute_merged" else "sent",
+                        export=delivered.get("export") if delivered else None,
                     )
             ledger["queue"][:] = [j for j in ledger["queue"] if j["id"] != job["id"]]
             if ledger["queue"]:

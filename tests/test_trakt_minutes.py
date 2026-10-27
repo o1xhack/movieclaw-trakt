@@ -574,3 +574,148 @@ async def test_source_receipts_scope_and_identity_changes(harness):
     assert not await e.source_delivery(0, "other", movie, "playback:1")
     assert not await e.source_delivery(0, "first", movie, "playback:2")
     assert not await e.source_delivery(0, "first", {"movie": {"ids": {"tmdb": 12}}}, "playback:1")
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("failure", ["lost", "exit", "receipt", "not_committed", "existing"])
+async def test_native_reconciles_uncertain_export_intent(harness, monkeypatch, kind, failure):
+    row = local(kind, "2020-01-01T12:34:59Z")
+    service, native = MinuteService(lose_response=failure == "lost"), []
+    if failure == "existing":
+        service.seed(target(row), row["watches"][0]["watched_at"])
+    first = True
+
+    def dispatch(request):
+        nonlocal first
+        if request.url.path == "/scrobble/stop":
+            native.append(1)
+            service.seed(target(row), "2020-01-01T12:35:01Z")
+            return httpx.Response(201, json={"action": "scrobble"})
+        if request.method == "POST" and request.url.path == "/sync/history" and first:
+            first = False
+            if failure == "not_committed":
+                return httpx.Response(503)
+            response = service(request)
+            if failure == "exit":
+                raise RuntimeError("fixture exit after export commit")
+            return response
+        return service(request)
+
+    e, store, clock, _ = await harness(dispatch)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    if failure in {"receipt", "existing"}:
+        original_set = store.set
+        interrupted = False
+
+        async def fail_receipt_once(key, value, **kwargs):
+            nonlocal interrupted
+            if key.startswith("watch_source_") and value["state"] == "sent" and not interrupted:
+                interrupted = True
+                raise OSError("fixture export source receipt interrupted")
+            await original_set(key, value, **kwargs)
+
+        monkeypatch.setattr(store, "set", fail_receipt_once)
+    t = Transfers(e, Ops([row]))
+    task = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, task["id"], task["preview_token"])
+    if failure == "exit":
+        with pytest.raises(RuntimeError):
+            await t.step(task["id"], 0)
+    else:
+        await t.step(task["id"], 0)
+    restored = Engine(store, e.client, e.health, e.log, clock=e.clock)
+    await restored.accept(
+        "completed",
+        {
+            "member_id": 0,
+            "media": row["media"],
+            "unit": row,
+            "position_ms": 100,
+            "duration_ms": 100,
+            "watch_source_ids": [row["watches"][0]["id"]],
+        },
+        "late-native",
+        "2020-01-01T12:34:59Z",
+    )
+    await restored.drain(0)
+    clock[0] += 120
+    await drive(Transfers(restored, Ops([row])), task, "complete")
+    assert not native
+    assert len(service.posts) == int(failure != "existing")
+    assert sum(map(len, service.rows.values())) == 1
+    assert next(r for rows in service.rows.values() for r in rows)["watched_at"] == (
+        "2020-01-01T12:34:00Z"
+    )
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("later_stop", [False, True])
+async def test_export_alias_receipt_restores_original_minute_ownership(harness, kind, later_stop):
+    row, service = local(kind), MinuteService()
+    e, _, _, _ = await harness(service)
+    t = Transfers(e, Ops([row]))
+    first = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, first["id"], first["preview_token"])
+    await drive(t, first, "complete")
+    watch = row["watches"][0]
+    watch["source_ids"] = [watch["id"], "playback:new-anchor"]
+    watch["id"] = "playback:new-anchor"
+    if later_stop:
+        watch["watched_at"] = "2020-01-01T12:45:00Z"
+    row["watches"].append(
+        {"id": "playback:another", "watched_at": "2020-01-01T12:34:55Z", "basis": "playback"}
+    )
+    again = await drive(t, await t.create(0, "export"), "ready")
+    assert again["total"] == 1 and again["minute_collisions"] == 1
+    await t.confirm(0, again["id"], again["preview_token"])
+    done = await drive(t, again, "complete_with_errors")
+    assert done["done"] == 0 and done["skipped"] == 1 and len(service.posts) == 1
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+async def test_native_recovery_preserves_interrupted_export_merge(harness, monkeypatch, kind):
+    row, service = local(kind), MinuteService()
+    e, store, clock, requests = await harness(service)
+    t = Transfers(e, Ops([row]))
+    task = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, task["id"], task["preview_token"])
+    await drive(t, task, "complete")
+    second = {"id": "playback:second", "watched_at": "2020-01-01T12:34:55Z", "basis": "playback"}
+    row["watches"].append(second)
+    again = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, again["id"], again["preview_token"])
+    original_set = store.set
+    interrupted = False
+
+    async def fail_merge_once(key, value, **kwargs):
+        nonlocal interrupted
+        if (
+            key.startswith("watch_source_")
+            and value["state"] == "minute_merged"
+            and not interrupted
+        ):
+            interrupted = True
+            raise OSError("fixture merge receipt interrupted")
+        await original_set(key, value, **kwargs)
+
+    monkeypatch.setattr(store, "set", fail_merge_once)
+    await t.step(again["id"], 0)
+    restored = Engine(store, e.client, e.health, e.log, clock=e.clock)
+    await restored.accept(
+        "completed",
+        {
+            "member_id": 0,
+            "media": row["media"],
+            "unit": row,
+            "position_ms": 100,
+            "duration_ms": 100,
+            "watch_source_ids": [second["id"]],
+        },
+        "late-merged-native",
+        second["watched_at"],
+    )
+    await restored.drain(0)
+    clock[0] += 120
+    done = await drive(Transfers(restored, Ops([row])), again, "complete_with_errors")
+    assert done["done"] == 0 and done["skipped"] == 1
+    assert len(service.posts) == 1 and not [r for r in requests if r.url.path == "/scrobble/stop"]

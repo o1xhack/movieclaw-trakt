@@ -23,7 +23,8 @@ from .test_transfers import drive
 pytestmark = pytest.mark.skipif(os.getenv("MOVIECLAW_HOST_QA") != "1", reason="isolated host QA")
 
 
-def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeypatch):
+@pytest.mark.parametrize("export_first", [False, True])
+def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeypatch, export_first):
     from movieclaw_api.services import durable_events
     from movieclaw_api.services.host_ops import HostOps
     from movieclaw_db.engine import get_database
@@ -57,13 +58,19 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
             await s.commit()
         durable_events.reset_subscribed()
         service, native = MinuteService(), []
+        lose_export = export_first
 
         def dispatch(request):
+            nonlocal lose_export
             if request.url.path == "/scrobble/stop":
                 native.append(json.loads(request.content))
                 service.seed({"movie": {"ids": {"tmdb": 11}}}, iso_time(now()))
                 return httpx.Response(201, json={"action": "scrobble"})
-            return service(request)
+            response = service(request)
+            if request.url.path == "/sync/history" and request.method == "POST" and lose_export:
+                lose_export = False
+                raise httpx.ReadError("fixture export response lost", request=request)
+            return response
 
         def now():
             return clock[0].replace(tzinfo=timezone.utc).timestamp()
@@ -118,9 +125,10 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 },
                 secret=True,
             )
-            await engine.accept("completed", payload, event_id, occurred_at)
-            clock[0] = datetime(2020, 1, 1, 12, 35, 1)
-            await engine.drain(0)
+            if not export_first:
+                await engine.accept("completed", payload, event_id, occurred_at)
+                clock[0] = datetime(2020, 1, 1, 12, 35, 1)
+                await engine.drain(0)
             clock[0] = datetime(2020, 1, 1, 12, 45)
             await report("stop", 600_000)
             # Use the actual granted HostOps gateway, without the HTTP fixture login override.
@@ -143,11 +151,21 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 restored = Engine(store, engine.client, engine.health, engine.log, clock=now)
                 transfers = Transfers(restored, gateway)
                 task = await drive(transfers, await transfers.create(0, "export"), "ready")
-                assert task["total"] == 0
+                assert task["total"] == int(export_first)
                 await transfers.confirm(0, task["id"], task["preview_token"])
+                if export_first:
+                    await transfers.step(task["id"], 0)
+                    restored = Engine(store, engine.client, engine.health, engine.log, clock=now)
+                    await restored.accept("completed", payload, event_id, occurred_at)
+                    await restored.drain(0)
+                    transfers = Transfers(restored, gateway)
+                    clock[0] = datetime(2020, 1, 1, 12, 50)
                 await drive(transfers, task, "complete")
-                assert len(native) == 1 and not service.posts
-                assert service.rows["movies"][0]["watched_at"] == "2020-01-01T12:35:00Z"
+                assert len(native) == int(not export_first)
+                assert len(service.posts) == int(export_first)
+                assert service.rows["movies"][0]["watched_at"] == (
+                    "2020-01-01T12:45:00Z" if export_first else "2020-01-01T12:35:00Z"
+                )
                 assert not await restored.source_delivery(
                     2, "source-binding", {"movie": {"ids": {"tmdb": 11}}}, source_id
                 )
