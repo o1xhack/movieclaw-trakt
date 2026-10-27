@@ -101,7 +101,8 @@ class ActivityLog:
                 **metadata,
                 occurred_at=job["occurred_at"],
                 state="skipped"
-                if outcome in ("expired", "local_deleted", "dismissed", "manual_unwatched")
+                if outcome
+                in ("expired", "local_deleted", "dismissed", "manual_unwatched", "minute_merged")
                 else "sent",
                 completed_at=iso_time(self.clock()),
                 reason={
@@ -111,6 +112,7 @@ class ActivityLog:
                     "manual_unwatched": "较新的手动取消已看已覆盖此播放记录，停止旧任务补传",
                     "ignored_short_play": "已清除正在观看；短播放未记入已看历史",
                     "already_synced": "已确认 Trakt 中存在记录，未重复添加",
+                    "minute_merged": "Trakt 按分钟合并，同一分钟的额外观看无法单独保存",
                 }.get(outcome),
             )
         except Exception:

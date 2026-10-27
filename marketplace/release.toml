@@ -1,4 +1,5 @@
 # 发布前显式填写已兼容的 MovieClaw Server 正式版；不是最低版本声明。
 # 先演练。配置 MARKETPLACE_PR_TOKEN 并完成验证后，再改成 true。
 enabled = false
+# beta.3 依赖上游 #1063；正式发布后需重新验证并更新目标，禁止用当前目标开启提交。
 movieclaw_release = "v0.43.0"

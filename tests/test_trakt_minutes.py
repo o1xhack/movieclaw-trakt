@@ -434,3 +434,143 @@ async def test_rejected_stop_window_is_cleared_before_uncertain_token_refresh(
     assert len(service.posts) == 1 and len(service.rows["movies"]) == 2
     assert observed == [None]  # Rejected attempt removed durably before /oauth/token.
     assert not (await restarted.status(0))["pending"]
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("outcome", ["ack", "lost", "exit", "receipt_failure"])
+async def test_native_source_receipt_prevents_export_after_later_stop(
+    harness, kind, outcome, monkeypatch
+):
+    row = local(kind, "2020-01-01T12:34:59Z")
+    service, native = MinuteService(), []
+
+    def handler(request):
+        if request.url.path == "/scrobble/stop":
+            native.append(1)
+            service.seed(target(row), "2020-01-01T12:35:01Z")
+            if outcome == "lost":
+                raise httpx.ReadError("native acknowledgement lost", request=request)
+            if outcome == "exit":
+                raise RuntimeError("fixture exit after native commit")
+            return httpx.Response(201, json={"action": "scrobble"})
+        return service(request)
+
+    e, store, clock, _ = await harness(handler)
+    if outcome == "receipt_failure":
+        original_set = store.set
+        interrupted = False
+
+        async def fail_receipt_once(key, value, **kwargs):
+            nonlocal interrupted
+            if key.startswith("watch_source_") and not interrupted:
+                interrupted = True
+                raise OSError("fixture receipt commit interrupted after native success")
+            await original_set(key, value, **kwargs)
+
+        monkeypatch.setattr(store, "set", fail_receipt_once)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    event = {
+        "member_id": 0,
+        "media": row["media"],
+        "unit": row,
+        "position_ms": 100,
+        "duration_ms": 100,
+        "client": {"device_id": "fixture"},
+        "watch_source_ids": [row["watches"][0]["id"]],
+    }
+    await e.accept("completed", event, "native", "2020-01-01T12:34:59Z")
+    if outcome in {"exit", "receipt_failure"}:
+        with pytest.raises(RuntimeError if outcome == "exit" else OSError):
+            await e.drain(0)
+    else:
+        await e.drain(0)
+    clock[0] += 120
+    e = Engine(store, e.client, e.health, e.log, clock=e.clock)
+    if outcome != "ack":
+        await e.drain(0)
+    # Real host catalog uses the final stop time, not the earlier completion-event time.
+    row["watches"][0]["source_ids"] = [row["watches"][0]["id"], "playback:new-first"]
+    row["watches"][0]["id"] = "playback:new-first"
+    row["watches"][0]["watched_at"] = "2020-01-01T12:45:00Z"
+    clock[0] = timestamp("2020-01-01T12:50:00Z")
+    t = Transfers(e, Ops([row]))
+    task = await drive(t, await t.create(0, "export"), "ready")
+    assert task["total"] == 0  # Stable source identity, despite changed timestamps.
+    await t.confirm(0, task["id"], task["preview_token"])
+    await drive(t, task, "complete")
+    assert len(native) == 1 and not service.posts
+    # Another local viewing is distinct even if its source time shares the native event minute.
+    row["watches"].append(
+        {"id": "playback:second", "watched_at": "2020-01-01T12:34:30Z", "basis": "playback"}
+    )
+    again = await drive(t, await t.create(0, "export"), "ready")
+    assert again["total"] == 1 and not again["minute_collisions"]
+    await t.confirm(0, again["id"], again["preview_token"])
+    await drive(t, again, "complete")
+    assert len(service.posts) == 1 and sum(map(len, service.rows.values())) == 2
+
+
+async def test_export_waits_for_same_source_native_recovery(harness, event):
+    row, service = local(), MinuteService()
+    native = []
+
+    def handler(request):
+        if request.url.path == "/scrobble/stop":
+            native.append(1)
+            service.seed(target(row), "2020-01-01T12:35:00Z")
+            raise httpx.ReadError("native response lost", request=request)
+        return service(request)
+
+    e, _, clock, _ = await harness(handler)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    await e.accept(
+        "completed",
+        {**event, "watch_source_ids": [row["watches"][0]["id"]]},
+        "native",
+        "2020-01-01T12:34:59Z",
+    )
+    await e.drain(0)
+    t = Transfers(e, Ops([row]))
+    task = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, task["id"], task["preview_token"])
+    done = await drive(t, task, "complete_with_errors")
+    assert done["failed"] == 1 and not service.posts
+    clock[0] += 120
+    await e.drain(0)
+    await t.control(0, task["id"], "resume")
+    done = await drive(t, task, "complete")
+    assert done["done"] == 1 and len(native) == 1 and not service.posts
+
+
+async def test_late_native_event_reuses_exported_source_receipt(harness, event):
+    row, service = local(), MinuteService()
+    e, _, clock, requests = await harness(service)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    t = Transfers(e, Ops([row]))
+    task = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, task["id"], task["preview_token"])
+    await drive(t, task, "complete")
+    await e.accept(
+        "completed",
+        {**event, "watch_source_ids": [row["watches"][0]["id"]]},
+        "late-native",
+        row["watches"][0]["watched_at"],
+    )
+    await e.drain(0)
+    assert not (await e.status(0))["pending"]
+    assert len(service.posts) == 1
+    assert not [r for r in requests if r.url.path == "/scrobble/stop"]
+
+
+async def test_source_receipts_scope_and_identity_changes(harness):
+    e, _, _, _ = await harness()
+    movie = {"movie": {"ids": {"tmdb": 11}}}
+    await e.remember_source_delivery(0, "first", movie, "playback:1")
+    assert await e.source_delivery(0, "first", movie, "playback:1") == "sent"
+    assert await e.source_delivery(
+        0, "first", {"movie": {"ids": {"tmdb": 11, "imdb": "tt001"}}}, "playback:1"
+    )
+    assert not await e.source_delivery(2, "first", movie, "playback:1")
+    assert not await e.source_delivery(0, "other", movie, "playback:1")
+    assert not await e.source_delivery(0, "first", movie, "playback:2")
+    assert not await e.source_delivery(0, "first", {"movie": {"ids": {"tmdb": 12}}}, "playback:1")

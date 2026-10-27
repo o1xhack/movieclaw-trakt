@@ -6,7 +6,7 @@ Sync movie and episode playback reported by MovieClaw to each connected member's
 
 > The default public Trakt application is maintained by MovieClaw. No Client ID registration or Client Secret is required: sign in to your own Trakt account and approve the device authorization.
 
-> This branch is the unreleased `0.3.0-beta.2` candidate for official MovieClaw **v0.43.0**. The marketplace stable version remains 0.2.3.
+> This unreleased `0.3.0-beta.3` requires the playback event 1.1 contracts proposed in [upstream #1063](https://github.com/movieclaw/MovieClaw/pull/1063). Official v0.43.0 does not meet this candidate's requirements. Marketplace stable remains 0.2.3.
 
 ## Install and update
 
@@ -28,7 +28,7 @@ Free Trakt accounts currently allow two Community Apps, excluding official Trakt
 - Manual, foreground-only history export/import: scan, review full movie/per-season groups, Confirm, then batched progress. Hiding/closing the page stops new batches; resuming is explicit. Trakt stores UTC minutes: export floors the remote timestamp without changing local seconds/microseconds, and import preserves the actual API-returned time. Rewatches in different minutes remain distinct; extra same-minute source watches are disclosed and skipped. Match only local holdings.
 - A separate History page loads batch summaries first and details on demand. Durable receipts and activity/inventory checks support incremental reconciliation; playback progress and media files are not imported.
 
-The candidate targets the released v0.43.0 catalog/import host operations without host patches or new ports. See the [detailed workflow](docs/sync-workflow.zh-CN.md) and [minute precision contract](docs/trakt-time-contract.zh-CN.md), based on [Trakt announcement #694](https://github.com/trakt/trakt-api/discussions/694). Lost remote seconds cannot be reconstructed.
+Catalog/import operations shipped in #973. Sharing source receipts between real-time delivery and history export additionally needs the common watch-log IDs proposed in #1063. Paired tests use the isolated proposed host source; no production host change, new port or permission is made. See the [workflow](docs/sync-workflow.zh-CN.md) and [minute precision contract](docs/trakt-time-contract.zh-CN.md). Lost remote seconds cannot be reconstructed.
 
 Offline support is limited to events the host actually emits. Missing rewatches or historical completion events cannot be reconstructed. This version does not promise a usable `viewing_id` or complete per-offline-viewing history. The app must run again and reconnect; a full iPhone airplane-mode/playback/reconnection test remains pending.
 
@@ -44,7 +44,7 @@ MovieClaw Trakt uses Trakt but is not endorsed or certified by Trakt.
 
 ## Release tracks and recovery
 
-`main` and the marketplace use stable 0.2.3. The separate `dev` / `0.3.0-beta.2` candidate integrates stable fixes and targets released v0.43.0. It is not deployed or published; current-head review, CI and release acceptance remain separate gates.
+`main` and the marketplace use stable 0.2.3. Separate `dev` / `0.3.0-beta.3` awaits upstream #1063 review, merge and a formal host release. CI pins the proposal commit; it does not establish compatibility with released v0.43.0. No deployment or publication has occurred.
 
 Retries read current media metadata via `library.list` and `library.items.get`, using the original file ID when available. Completed views are checked against nearby Trakt history before adding a missing view with its original timestamp. Deleted media/file records retire the task; temporarily missing files wait. No media file access or writes are granted. Failed jobs retry with 10-minute to 6-hour backoff. Expired live events are retired, never converted into watched history.
 

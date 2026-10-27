@@ -119,6 +119,65 @@ class Engine(ActivityLog, Recovery):
             ):
                 await self.set(member, key, {"generation": generation, "at": occurred_at})
 
+    @staticmethod
+    def source_key(generation, source_id):
+        return (
+            "watch_source_"
+            + hashlib.sha256(json.dumps([generation, source_id]).encode()).hexdigest()
+        )
+
+    @staticmethod
+    def source_ids(values):
+        values = [values] if isinstance(values, str) else values or []
+        return tuple(dict.fromkeys(v for v in values if isinstance(v, str) and 0 < len(v) <= 200))
+
+    async def source_delivery(self, member, generation, item, source_ids):
+        state = False
+        for source_id in self.source_ids(source_ids):
+            delivered = await self.get(member, self.source_key(generation, source_id))
+            if not delivered:
+                continue
+            previous = delivered["item"]
+            if ("movie" in previous) != ("movie" in item) or not matches(previous, item):
+                continue
+            old_ids = previous.get("movie", previous.get("show"))["ids"]
+            new_ids = item.get("movie", item.get("show"))["ids"]
+            if any(old_ids[k] != new_ids[k] for k in old_ids.keys() & new_ids.keys()):
+                continue
+            state = delivered["state"]
+            if state == "sent":
+                return state
+        return state
+
+    async def remember_source_delivery(self, member, generation, item, source_ids, state="sent"):
+        for source_id in self.source_ids(source_ids):
+            key = self.source_key(generation, source_id)
+            value = {"item": item, "state": state}
+            previous = await self.get(member, key)
+            if previous == value or (
+                previous
+                and previous["item"] == item
+                and previous["state"] == "sent"
+                and state == "minute_merged"
+            ):
+                continue
+            await self.set(
+                member,
+                key,
+                value,
+            )
+
+    async def source_pending(self, member, generation, source_ids):
+        source_ids = set(self.source_ids(source_ids))
+        if not source_ids:
+            return False
+        ledger = await self.ledger(member)
+        return any(
+            j["generation"] == generation
+            and source_ids.intersection(j.get("source", {}).get("watch_ids", []))
+            for j in [*ledger["queue"], *ledger.get("failed", [])]
+        )
+
     async def has_newer_watch(self, member, generation, item, media_id, occurred_at):
         for key in self.unwatch_keys(item, media_id, prefix="watch"):
             mark = await self.get(member, key)
@@ -597,6 +656,7 @@ class Engine(ActivityLog, Recovery):
                         "source": {
                             "media_id": event["media"]["id"],
                             "file_id": event.get("file_id"),
+                            "watch_ids": self.source_ids(event.get("watch_source_ids")),
                         },
                         "attempt": 0,
                         "next_at": self.clock(),
@@ -783,6 +843,16 @@ class Engine(ActivityLog, Recovery):
                 late = self.clock() - timestamp(job["occurred_at"]) > 300
                 finished = self.finished(job)
                 uncertain = job["uncertain"]
+                delivered = (
+                    await self.source_delivery(
+                        member,
+                        account["generation"],
+                        job["item"],
+                        job.get("source", {}).get("watch_ids"),
+                    )
+                    if finished
+                    else False
+                )
                 if finished and await self.waiting_unwatch(member, job):
                     job["next_at"] = self.clock() + 2
                     await self.save_ledger(member, ledger)
@@ -795,6 +865,12 @@ class Engine(ActivityLog, Recovery):
                     job.get("source", {}).get("media_id"),
                 ):
                     result = {"action": "manual_unwatched"}
+                elif delivered:
+                    result = {
+                        "action": "minute_merged"
+                        if delivered == "minute_merged"
+                        else "already_synced"
+                    }
                 elif late and not finished:
                     result = {"action": "expired"}
                 else:
@@ -915,6 +991,16 @@ class Engine(ActivityLog, Recovery):
                     job.get("source", {}).get("media_id"),
                     job["occurred_at"],
                 )
+                if result.get("action") in {"scrobble", "already_synced"} or (
+                    job["path"] == "/sync/history" and isinstance(result.get("added"), dict)
+                ):
+                    # Commit the source receipt before removing the queued delivery.
+                    await self.remember_source_delivery(
+                        member,
+                        job["generation"],
+                        job["item"],
+                        job.get("source", {}).get("watch_ids"),
+                    )
             ledger["queue"][:] = [j for j in ledger["queue"] if j["id"] != job["id"]]
             if ledger["queue"]:
                 ledger["queue"][0]["next_at"] = max(ledger["queue"][0]["next_at"], self.clock() + 1)

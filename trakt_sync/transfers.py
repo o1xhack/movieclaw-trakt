@@ -35,6 +35,10 @@ def minute_key(row):
     return "minute_" + digest([item(row), trakt_minute(row["watched_at"])])
 
 
+def source_ids(row):
+    return [row["source_id"], *row.get("source_ids", [])]
+
+
 def summary(task):
     return {k: v for k, v in task.items() if k not in {"generation", "remote_stamp", "signature"}}
 
@@ -119,9 +123,39 @@ class Transfers:
         scope = f"synced:{task['member_id']}-{task['generation']}"
         key = fingerprint(task["direction"], row)
         if write:
+            if task["direction"] == "export":
+                await self.e.remember_source_delivery(
+                    task["member_id"],
+                    task["generation"],
+                    item(row),
+                    source_ids(row),
+                    "minute_merged" if merged else "sent",
+                )
             await self.store.set(key, "minute_merged" if merged else True, scope=scope)
         else:
-            return await self.store.get(key, scope=scope, default=False)
+            saved = await self.store.get(key, scope=scope, default=False)
+            if saved:
+                if task["direction"] == "export":
+                    await self.e.remember_source_delivery(
+                        task["member_id"],
+                        task["generation"],
+                        item(row),
+                        source_ids(row),
+                        "minute_merged" if saved == "minute_merged" else "sent",
+                    )
+                return saved
+            delivered = (
+                await self.e.source_delivery(
+                    task["member_id"], task["generation"], item(row), source_ids(row)
+                )
+                if task["direction"] == "export"
+                else False
+            )
+            if delivered == "minute_merged":
+                return "minute_merged"
+            if delivered:
+                return "native"
+            return False
 
     async def add_plans(self, task, rows):
         pending = []
@@ -169,6 +203,7 @@ class Transfers:
                             "episode": unit["episode"],
                             "watched_at": watch["watched_at"],
                             "source_id": watch["id"],
+                            "source_ids": list(watch.get("source_ids", [])),
                             "basis": watch["basis"],
                             "expected_updated_at": unit["updated_at"],
                         }
@@ -422,8 +457,10 @@ class Transfers:
             row["state"] = "skipped" if saved == "minute_merged" else "sent"
             if saved == "minute_merged":
                 row["reason"] = "Trakt 按分钟合并，同一分钟的额外观看无法单独保存"
-            elif task["direction"] == "export" and not await self.store.get(
-                minute_key(row), scope=self.scope(task)
+            elif (
+                saved is True
+                and task["direction"] == "export"
+                and not await self.store.get(minute_key(row), scope=self.scope(task))
             ):
                 await self.store.set(
                     minute_key(row), fingerprint("export", row), scope=self.scope(task)
@@ -487,6 +524,9 @@ class Transfers:
                 )
             ):
                 row.update(state="skipped", reason="扫描后本地观看状态已变化")
+                return
+            if await self.e.source_pending(task["member_id"], task["generation"], source_ids(row)):
+                row.update(state="failed", reason="同次实时播放尚未投递完成，请稍后重试此任务")
                 return
             exists = await self.remote_has(task, row)
             owner = await self.store.get(minute_key(row), scope=self.scope(task))
