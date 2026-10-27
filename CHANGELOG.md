@@ -4,6 +4,7 @@
 
 - Follow Trakt #694 UTC minute precision for history writes and deduplication; reconcile lost responses without confusing adjacent minutes. Keep local seconds/microseconds and event ordering intact. Disclose and skip extra same-minute watches rather than claiming lossless export; imported timestamps retain only precision actually returned by Trakt.
 - Reconcile uncertain native scrobbles using a persisted dispatch window after authorization refresh, since Trakt assigns their time. Preserve source-minute matching when switching to explicit history, clear definite-rejection windows, and guard capacity trimming before dispatch.
+- Clear a 401-rejected native dispatch window durably before refreshing OAuth tokens, so an uncertain refresh response cannot falsely reconcile an unrelated watch.
 - Integrate all stable 0.2.3 authentication, queue-capacity, metadata recovery and UI repairs into the separate dev track.
 - Target released MovieClaw v0.43.0 for catalog/import APIs and CI; keep marketplace automation disabled.
 - Add three independent default-off member preferences, activity filters and confirmed foreground history import/export with original movie/episode dates, rewatches, grouped previews and durable incremental receipts. No ratings, member self-service or background bulk transfer.

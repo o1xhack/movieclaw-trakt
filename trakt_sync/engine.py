@@ -634,7 +634,16 @@ class Engine(ActivityLog, Recovery):
                 )
 
     async def authorized(
-        self, member, account, method, path, body=None, params=None, *, before_send=None
+        self,
+        member,
+        account,
+        method,
+        path,
+        body=None,
+        params=None,
+        *,
+        before_send=None,
+        after_rejection=None,
     ):
         # 一次投递可能先查历史再写入；前一步可能已经轮换了单次刷新令牌。
         account = await self.get(member, "account", account)
@@ -651,6 +660,8 @@ class Engine(ActivityLog, Recovery):
         except TraktError as exc:
             if exc.status != 401:
                 raise
+            if after_rejection:
+                await after_rejection()
             account = await self.refresh(member, account)
             if before_send:
                 await before_send()
@@ -705,6 +716,12 @@ class Engine(ActivityLog, Recovery):
             raise DeliveryEvicted
 
     async def native_stop(self, member, account, ledger, job):
+        async def after_rejection():
+            # Token-refresh uncertainty cannot turn a rejected stop into a
+            # possibly committed watch. Persist this before refreshing tokens.
+            job.pop("scrobble_window", None)
+            await self.save_inflight(member, ledger, job)
+
         async def before_send():
             now = self.clock()
             job["scrobble_window"] = {
@@ -718,7 +735,13 @@ class Engine(ActivityLog, Recovery):
 
         try:
             return await self.authorized(
-                member, account, "POST", job["path"], job["body"], before_send=before_send
+                member,
+                account,
+                "POST",
+                job["path"],
+                job["body"],
+                before_send=before_send,
+                after_rejection=after_rejection,
             )
         except TraktError as exc:
             if not exc.uncertain:

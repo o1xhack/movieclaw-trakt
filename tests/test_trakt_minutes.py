@@ -397,3 +397,40 @@ async def test_definite_native_rejection_does_not_reuse_dispatch_window(harness,
     await e.drain(0)
     assert len(service.posts) == 1
     assert len(service.rows["movies"]) == 2
+
+
+@pytest.mark.parametrize("refresh_failure", ["network", "server", "process_exit"])
+async def test_rejected_stop_window_is_cleared_before_uncertain_token_refresh(
+    harness, event, refresh_failure
+):
+    service = MinuteService()
+    observed = []
+
+    def handler(request):
+        if request.url.path == "/scrobble/stop":
+            return httpx.Response(401)
+        if request.url.path == "/oauth/token":
+            observed.append(store.data["member:0", "ledger"]["queue"][0].get("scrobble_window"))
+            clock[0] += 61
+            if refresh_failure == "process_exit":
+                raise RuntimeError("fixture exit during token refresh after stop rejection")
+            if refresh_failure == "network":
+                raise httpx.ReadError("token response lost", request=request)
+            return httpx.Response(503)
+        return service(request)
+
+    e, store, clock, _ = await harness(handler)
+    clock[0] = timestamp("2020-01-01T12:35:01Z")
+    service.seed({"movie": {"ids": {"tmdb": 11}}}, "2020-01-01T12:35:00Z")
+    await e.accept("completed", event, "native", "2020-01-01T12:34:59Z")
+    if refresh_failure == "process_exit":
+        with pytest.raises(RuntimeError):
+            await e.drain(0)
+    else:
+        await e.drain(0)
+    clock[0] += 120
+    restarted = Engine(store, e.client, e.health, e.log, clock=e.clock)
+    await restarted.drain(0)
+    assert len(service.posts) == 1 and len(service.rows["movies"]) == 2
+    assert observed == [None]  # Rejected attempt removed durably before /oauth/token.
+    assert not (await restarted.status(0))["pending"]
