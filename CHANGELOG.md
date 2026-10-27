@@ -6,6 +6,8 @@
 - Target released MovieClaw v0.43.0 for catalog/import APIs and CI; keep marketplace automation disabled.
 - Add three independent default-off member preferences, activity filters and confirmed foreground history import/export with original movie/episode dates, rewatches, grouped previews and durable incremental receipts. No ratings, member self-service or background bulk transfer.
 - Treat ordinary HTTP 400 as an item error, continue after terminal action failures, and block only the affected Trakt account on authorization rejection. Missing host grants pause a transfer without invalidating Trakt credentials.
+- Coordinate manual unwatches with older playback queues and durable late events through member/unit/binding-scoped persisted cutoffs; newer watches remain eligible.
+- Skip exports when external media identity changes after preview, requiring a fresh scan and confirmation.
 - Retain previews without starting writes when confirmation-time Trakt revalidation fails; respect Retry-After and block rejected accounts.
 - Retain stable retry/correction/dismissal controls and verify real host durable events, admin-only routes and isolated dated import/export without production account writes.
 

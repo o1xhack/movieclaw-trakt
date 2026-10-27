@@ -144,6 +144,13 @@ class Actions:
                 path = task["path"]
                 body = row.get("body") or history_body(item(row), row["watched_at"])
                 if path == "/sync/history/remove":
+                    await self.e.remember_unwatch(
+                        task["member_id"],
+                        task["generation"],
+                        item(row),
+                        row["media"]["id"],
+                        row["watched_at"],
+                    )
                     for movie in body.get("movies", []):
                         movie.pop("watched_at", None)
                     for show in body.get("shows", []):

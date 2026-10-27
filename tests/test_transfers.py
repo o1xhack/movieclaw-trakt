@@ -493,3 +493,18 @@ async def test_confirmation_remote_failure_retains_preview_and_honors_retry_afte
         clock[0] = retained["next_at"] + 1
         assert (await t.confirm(0, task["id"], task["preview_token"]))["state"] == "running"
         assert not ops.writes
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+async def test_export_rejects_identity_corrected_after_preview(harness, kind):
+    e, _, _, requests = await harness()
+    row = unit(kind=kind, season=1 if kind == "tv" else 0, episode=2 if kind == "tv" else 0)
+    ops = Ops([row])
+    t = Transfers(e, ops)
+    task = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, task["id"], task["preview_token"])
+    row["media"]["tmdb_id"] = 22
+    await t.step(task["id"], 0)
+    result = await t.step(task["id"], 0)
+    assert result["state"] == "complete_with_errors" and result["skipped"] == 1
+    assert not requests  # Never even query history for the obsolete external identity.

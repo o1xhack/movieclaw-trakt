@@ -282,3 +282,81 @@ async def test_rate_limit_keeps_task_and_respects_retry_after(harness, event):
     clock[0] = task["next_at"] + 1
     await drive(Actions(e), 0, task["id"], "complete")
     assert len(requests) == 2
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("episode", [False, True])
+async def test_unwatch_supersedes_older_playback_and_late_redelivery(
+    harness, event, failed, episode
+):
+    reject = [failed]
+
+    def handler(r):
+        if r.method == "POST" and r.url.path == "/sync/history" and reject[0]:
+            return httpx.Response(422)
+
+    e, store, clock, requests = await harness(handler)
+    if episode:
+        event = {
+            **event,
+            "media": {**event["media"], "kind": "tv"},
+            "unit": {"season": 1, "episode": 2},
+        }
+    await e.set(0, "profile", Preferences(manual_unwatched=True).model_dump())
+    old = iso_time(clock[0] - 600)
+    await e.accept("completed", event, "old-completion", old)
+    if failed:
+        await e.drain(0)
+        assert len((await e.ledger(0))["failed"]) == 1
+    requests.clear()
+    a = Actions(e)
+    await a.automatic(
+        "marked_unplayed",
+        {**event, "units": [event["unit"]] if episode else []},
+        "unwatch",
+        iso_time(clock[0]),
+    )
+    task = next(iter((await store.scopes("task", entity="transfer")).values()))
+    await drive(a, 0, task["id"], "complete")
+    reject[0] = False
+    await e.retry_failed(0)
+    await e.drain(0)
+    assert [r.url.path for r in requests if r.method == "POST"] == ["/sync/history/remove"]
+    # Another durable consumer may deliver the older completion only after the unwatch.
+    await e.accept("completed", event, "late-old-completion", old)
+    await e.drain(0)
+    assert [r.url.path for r in requests if r.method == "POST"] == ["/sync/history/remove"]
+    clock[0] += 1
+    await e.accept("completed", event, "new-watch", iso_time(clock[0] - 0.5))
+    await e.drain(0)
+    assert [r.url.path for r in requests if r.method == "POST"] == [
+        "/sync/history/remove",
+        "/scrobble/stop",
+    ]
+
+
+async def test_unwatch_barrier_is_unit_member_and_binding_scoped(harness, event):
+    e, store, clock, requests = await harness()
+    event = {
+        **event,
+        "media": {**event["media"], "kind": "tv"},
+        "unit": {"season": 1, "episode": 2},
+    }
+    account = await e.get(0, "account")
+    from trakt_sync.policy import identity
+
+    await e.remember_unwatch(0, account["generation"], identity(event), 7, iso_time(clock[0]))
+    other = {**event, "unit": {"season": 1, "episode": 3}}
+    await e.accept("completed", other, "other-episode", iso_time(clock[0] - 600))
+    await e.drain(0)
+    assert json.loads(requests[-1].content)["shows"][0]["seasons"][0]["episodes"][0]["number"] == 3
+    await e.set(
+        2, "account", {**account, "generation": "member-two", "access_token": "two"}, secret=True
+    )
+    await e.accept("completed", {**event, "member_id": 2}, "other-member", iso_time(clock[0] - 600))
+    await e.drain(2)
+    assert requests[-1].headers["Authorization"] == "Bearer two"
+    await e.set(0, "account", {**account, "generation": "new-binding"}, secret=True)
+    await e.accept("completed", event, "new-binding", iso_time(clock[0] - 600))
+    await e.drain(0)
+    assert len([r for r in requests if r.method == "POST"]) == 3

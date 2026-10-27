@@ -100,12 +100,15 @@ class ActivityLog:
                 job["id"],
                 **metadata,
                 occurred_at=job["occurred_at"],
-                state="skipped" if outcome in ("expired", "local_deleted", "dismissed") else "sent",
+                state="skipped"
+                if outcome in ("expired", "local_deleted", "dismissed", "manual_unwatched")
+                else "sent",
                 completed_at=iso_time(self.clock()),
                 reason={
                     "expired": "实时播放事件已过期，不补报正在观看",
                     "local_deleted": "本地条目或文件已删除，已停止此条同步；不删除 Trakt 历史",
                     "dismissed": "用户已忽略此条记录，未补传也未删除 Trakt 历史",
+                    "manual_unwatched": "较新的手动取消已看已覆盖此播放记录，停止旧任务补传",
                     "ignored_short_play": "已清除正在观看；短播放未记入已看历史",
                     "already_synced": "已确认 Trakt 中存在记录，未重复添加",
                 }.get(outcome),

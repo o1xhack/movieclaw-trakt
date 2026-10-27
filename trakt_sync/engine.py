@@ -1,6 +1,7 @@
 """播放事件持久化与 Trakt 投递；每个成员独立加密凭据、队列和互斥锁。"""
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -46,6 +47,61 @@ class Engine(ActivityLog, Recovery):
         await self.store.set(key, value, scope=self.scope(member), secret=secret)
         if key == "account":
             await self.store.set("linked", True, scope=self.scope(member))
+
+    @staticmethod
+    def unwatch_keys(item, media_id=None):
+        unit = item.get("episode")
+        kind = "movie" if "movie" in item else "show"
+        identities = [(kind, k, v, unit) for k, v in item[kind]["ids"].items()]
+        if media_id is not None:
+            identities.append(("local", media_id, unit))
+        return [
+            "unwatch_" + hashlib.sha256(json.dumps(v, sort_keys=True).encode()).hexdigest()
+            for v in identities
+        ]
+
+    async def superseded_by_unwatch(self, member, generation, item, occurred_at, media_id=None):
+        for key in self.unwatch_keys(item, media_id):
+            mark = await self.get(member, key)
+            if (
+                mark
+                and mark["generation"] == generation
+                and timestamp(occurred_at) <= timestamp(mark["at"])
+            ):
+                return True
+        return False
+
+    async def remember_unwatch(self, member, generation, item, media_id, occurred_at):
+        """Called with the member lock, before removal; durable barriers also cover late delivery."""
+        keys = set(self.unwatch_keys(item, media_id))
+        for key in keys:
+            old = await self.get(member, key)
+            if (
+                not old
+                or old["generation"] != generation
+                or timestamp(old["at"]) < timestamp(occurred_at)
+            ):
+                await self.set(member, key, {"generation": generation, "at": occurred_at})
+        ledger = await self.ledger(member)
+        for name in ("queue", "failed"):
+            kept = []
+            for job in ledger.get(name, []):
+                job_keys = set(
+                    self.unwatch_keys(job["item"], job.get("source", {}).get("media_id"))
+                )
+                if (
+                    job["generation"] == generation
+                    and keys & job_keys
+                    and timestamp(job["occurred_at"]) <= timestamp(occurred_at)
+                ):
+                    await self.complete_activity(member, job, "manual_unwatched")
+                else:
+                    kept.append(job)
+            ledger[name] = kept
+        if not ledger["queue"] and not ledger["failed"]:
+            ledger["last_error"] = None
+            await self.health.ok(f"member-{member}")
+        await self.save_ledger(member, ledger)
 
     async def ledger(self, member):
         return await self.get(member, "ledger", {"queue": [], "seen": [], "sessions": {}})
@@ -413,6 +469,19 @@ class Engine(ActivityLog, Recovery):
             at = timestamp(occurred_at)
             if at > self.clock() + 60:
                 return
+            if item and await self.superseded_by_unwatch(
+                member, account["generation"], item, occurred_at, event["media"]["id"]
+            ):
+                if kind not in {"started", "progress"}:
+                    await self.record_activity(
+                        member,
+                        event_id,
+                        **describe(event, kind),
+                        occurred_at=occurred_at,
+                        state="skipped",
+                        reason="较新的手动取消已看已覆盖此播放记录",
+                    )
+                return
             key = session_key(event)
             state = ledger["sessions"].get(key, {})
             stale = self.clock() - at > 300
@@ -598,7 +667,15 @@ class Engine(ActivityLog, Recovery):
                 late = self.clock() - timestamp(job["occurred_at"]) > 300
                 finished = self.finished(job)
                 uncertain = job["uncertain"]
-                if late and not finished:
+                if await self.superseded_by_unwatch(
+                    member,
+                    account["generation"],
+                    job["item"],
+                    job["occurred_at"],
+                    job.get("source", {}).get("media_id"),
+                ):
+                    result = {"action": "manual_unwatched"}
+                elif late and not finished:
                     result = {"action": "expired"}
                 else:
                     # 写前记录不确定状态，覆盖远端成功但本地落盘前进程退出的窗口。
@@ -701,7 +778,7 @@ class Engine(ActivityLog, Recovery):
                 ledger["queue"][0]["next_at"] = max(ledger["queue"][0]["next_at"], self.clock() + 1)
             if job["path"] != "/scrobble/start" and ledger.get("watching") == job["key"]:
                 ledger.pop("watching", None)
-            if result.get("action") != "expired":
+            if result.get("action") not in {"expired", "manual_unwatched"}:
                 ledger["last_success"] = iso_time(self.clock())
             ledger["last_error"] = (
                 "有记录等待季集/编号核对；将定时自动核对，也可修正后立即重试"

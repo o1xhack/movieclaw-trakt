@@ -445,6 +445,9 @@ class Transfers:
                 {"member_id": task["member_id"], "cursor": cursor, "limit": 1},
             )
             current = next((u for u in data["items"] if unit_key(u) == unit_key(row)), None)
+            if current and item(current) != item(row):
+                row.update(state="skipped", reason="扫描后影片或季集编号已变化，请重新扫描确认")
+                return
             if (
                 not current
                 or not current["played"]
