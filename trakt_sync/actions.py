@@ -122,26 +122,57 @@ class Actions:
             await self.e.record_activity(
                 task["member_id"],
                 task["id"],
-                state="failed" if task["failed"] else "sent",
+                state="failed"
+                if task["failed"]
+                else "skipped"
+                if task["skipped"] and not task["done"]
+                else "sent",
                 completed_at=task["completed_at"],
                 title=task["title"],
                 event=task["event"],
                 occurred_at=task["created_at"],
                 kind="tv" if task["episodes"] else "movie",
-                reason="有条目未匹配，请在 Trakt 核对" if task["failed"] else None,
+                reason="有条目未匹配，请在 Trakt 核对"
+                if task["failed"]
+                else "较新的观看操作已覆盖旧任务，未重复发送"
+                if task["skipped"]
+                else None,
             )
             return
         key = f"plan_{task['cursor']}"
         rows = await self.store.get(key, scope=self.scope(task))
         processed = 0
         for row in rows:
-            if row["state"] in {"sent", "failed"}:
+            if row["state"] in {"sent", "failed", "skipped"}:
                 continue
             if processed >= 5:
                 return
             processed += 1
+            path = task["path"]
+            superseded = (
+                path == "/sync/history"
+                and await self.e.superseded_by_unwatch(
+                    task["member_id"],
+                    task["generation"],
+                    item(row),
+                    row["watched_at"],
+                    row["media"]["id"],
+                )
+            ) or (
+                path == "/sync/history/remove"
+                and await self.e.has_newer_watch(
+                    task["member_id"],
+                    task["generation"],
+                    item(row),
+                    row["media"]["id"],
+                    row["watched_at"],
+                )
+            )
+            if superseded:
+                row.update(state="skipped", reason="较新的观看操作已覆盖旧任务")
+                await self.store.set(key, rows, scope=self.scope(task))
+                continue
             try:
-                path = task["path"]
                 body = row.get("body") or history_body(item(row), row["watched_at"])
                 if path == "/sync/history/remove":
                     await self.e.remember_unwatch(
@@ -171,6 +202,14 @@ class Actions:
                         raise TraktError(502)
                     if any(result.get("not_found", {}).values()):
                         raise TraktError(404)
+                if path == "/sync/history":
+                    await self.e.remember_watch(
+                        task["member_id"],
+                        task["generation"],
+                        item(row),
+                        row["media"]["id"],
+                        row["watched_at"],
+                    )
                 row["state"] = "sent"
             except TraktError as exc:
                 if exc.auth_error or exc.status not in {400, 404, 422}:
@@ -180,6 +219,7 @@ class Actions:
         task["cursor"] += 1
         task["done"] += sum(r["state"] == "sent" for r in rows)
         task["failed"] += sum(r["state"] == "failed" for r in rows)
+        task["skipped"] += sum(r["state"] == "skipped" for r in rows)
 
     async def step(self, task_id, member):
         async with self.e.locks[member]:

@@ -49,14 +49,14 @@ class Engine(ActivityLog, Recovery):
             await self.store.set("linked", True, scope=self.scope(member))
 
     @staticmethod
-    def unwatch_keys(item, media_id=None):
+    def unwatch_keys(item, media_id=None, prefix="unwatch"):
         unit = item.get("episode")
         kind = "movie" if "movie" in item else "show"
         identities = [(kind, k, v, unit) for k, v in item[kind]["ids"].items()]
         if media_id is not None:
             identities.append(("local", media_id, unit))
         return [
-            "unwatch_" + hashlib.sha256(json.dumps(v, sort_keys=True).encode()).hexdigest()
+            prefix + "_" + hashlib.sha256(json.dumps(v, sort_keys=True).encode()).hexdigest()
             for v in identities
         ]
 
@@ -102,6 +102,53 @@ class Engine(ActivityLog, Recovery):
             ledger["last_error"] = None
             await self.health.ok(f"member-{member}")
         await self.save_ledger(member, ledger)
+
+    async def remember_watch(self, member, generation, item, media_id, occurred_at):
+        for key in self.unwatch_keys(item, media_id, prefix="watch"):
+            old = await self.get(member, key)
+            if (
+                not old
+                or old["generation"] != generation
+                or timestamp(old["at"]) < timestamp(occurred_at)
+            ):
+                await self.set(member, key, {"generation": generation, "at": occurred_at})
+
+    async def has_newer_watch(self, member, generation, item, media_id, occurred_at):
+        for key in self.unwatch_keys(item, media_id, prefix="watch"):
+            mark = await self.get(member, key)
+            if (
+                mark
+                and mark["generation"] == generation
+                and timestamp(mark["at"]) > timestamp(occurred_at)
+            ):
+                return True
+        return False
+
+    async def waiting_unwatch(self, member, job):
+        if not (await self.get(member, "profile", {})).get("manual_unwatched"):
+            return False
+        keys = set(self.unwatch_keys(job["item"], job.get("source", {}).get("media_id")))
+        for task in (await self.store.scopes("task", entity="transfer")).values():
+            if (
+                task["member_id"] != member
+                or task["generation"] != job["generation"]
+                or task["state"] not in {"running", "paused"}
+                or task.get("path") != "/sync/history/remove"
+            ):
+                continue
+            for page in range(task["plan_pages"]):
+                for row in await self.store.get(
+                    f"plan_{page}", scope=f"transfer:{task['id']}", default=[]
+                ):
+                    target = identity({"media": row["media"], "unit": row})
+                    if (
+                        row["state"] == "pending"
+                        and target
+                        and keys & set(self.unwatch_keys(target, row["media"]["id"]))
+                        and timestamp(row["watched_at"]) <= timestamp(job["occurred_at"])
+                    ):
+                        return True
+        return False
 
     async def ledger(self, member):
         return await self.get(member, "ledger", {"queue": [], "seen": [], "sessions": {}})
@@ -667,6 +714,10 @@ class Engine(ActivityLog, Recovery):
                 late = self.clock() - timestamp(job["occurred_at"]) > 300
                 finished = self.finished(job)
                 uncertain = job["uncertain"]
+                if finished and await self.waiting_unwatch(member, job):
+                    job["next_at"] = self.clock() + 2
+                    await self.save_ledger(member, ledger)
+                    return
                 if await self.superseded_by_unwatch(
                     member,
                     account["generation"],
@@ -773,6 +824,18 @@ class Engine(ActivityLog, Recovery):
                     await self.save_ledger(member, ledger)
                     await self.health.degraded(f"member-{member}", str(exc))
                     return
+            if self.finished(job) and result.get("action") not in {
+                "expired",
+                "local_deleted",
+                "manual_unwatched",
+            }:
+                await self.remember_watch(
+                    member,
+                    account["generation"],
+                    job["item"],
+                    job.get("source", {}).get("media_id"),
+                    job["occurred_at"],
+                )
             ledger["queue"][:] = [j for j in ledger["queue"] if j["id"] != job["id"]]
             if ledger["queue"]:
                 ledger["queue"][0]["next_at"] = max(ledger["queue"][0]["next_at"], self.clock() + 1)

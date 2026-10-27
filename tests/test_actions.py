@@ -322,6 +322,8 @@ async def test_unwatch_supersedes_older_playback_and_late_redelivery(
     await e.retry_failed(0)
     await e.drain(0)
     assert [r.url.path for r in requests if r.method == "POST"] == ["/sync/history/remove"]
+    # A new engine instance must read the persisted cutoff after a restart.
+    e = type(e)(store, e.client, e.health, e.log, clock=e.clock)
     # Another durable consumer may deliver the older completion only after the unwatch.
     await e.accept("completed", event, "late-old-completion", old)
     await e.drain(0)
@@ -360,3 +362,66 @@ async def test_unwatch_barrier_is_unit_member_and_binding_scoped(harness, event)
     await e.accept("completed", event, "new-binding", iso_time(clock[0] - 600))
     await e.drain(0)
     assert len([r for r in requests if r.method == "POST"]) == 3
+
+
+async def test_retry_old_failed_manual_watch_cannot_undo_unwatch(harness, event):
+    reject = [True]
+
+    def handler(r):
+        if r.method == "POST" and r.url.path == "/sync/history" and reject[0]:
+            return httpx.Response(422)
+
+    e, store, clock, requests = await harness(handler)
+    await e.set(0, "profile", Preferences(manual_watched=True, manual_unwatched=True).model_dump())
+    a = Actions(e)
+    await a.automatic("marked_played", event, "old-mark", iso_time(clock[0]))
+    old = next(iter((await store.scopes("task", entity="transfer")).values()))
+    await drive(a, 0, old["id"], "complete_with_errors")
+    clock[0] += 1
+    await a.automatic("marked_unplayed", event, "unmark", iso_time(clock[0]))
+    unmark = list((await store.scopes("task", entity="transfer")).values())[-1]
+    await drive(a, 0, unmark["id"], "complete")
+    reject[0] = False
+    before = len(requests)
+    await a.control(0, old["id"], "resume")
+    result = await drive(a, 0, old["id"], "complete")
+    assert result["skipped"] == 1 and len(requests) == before
+
+
+async def test_newer_playback_waits_for_pending_unwatch(harness, event):
+    e, store, clock, requests = await harness()
+    await e.set(0, "profile", Preferences(manual_unwatched=True).model_dump())
+    a = Actions(e)
+    await a.automatic("marked_unplayed", event, "unmark", iso_time(clock[0]))
+    task = next(iter((await store.scopes("task", entity="transfer")).values()))
+    clock[0] += 1
+    await e.accept("completed", event, "new-watch", iso_time(clock[0]))
+    await e.drain(0)
+    assert not requests
+    await drive(a, 0, task["id"], "complete")
+    clock[0] += 3
+    await e.drain(0)
+    assert [r.url.path for r in requests if r.method == "POST"] == [
+        "/sync/history/remove",
+        "/scrobble/stop",
+    ]
+
+
+@pytest.mark.parametrize("manual", [False, True])
+async def test_older_unwatch_cannot_remove_a_newer_delivered_watch(harness, event, manual):
+    e, store, clock, requests = await harness()
+    await e.set(0, "profile", Preferences(manual_watched=True, manual_unwatched=True).model_dump())
+    a = Actions(e)
+    older = iso_time(clock[0] - 10)
+    if manual:
+        await a.automatic("marked_played", event, "new-mark", iso_time(clock[0]))
+        task = next(iter((await store.scopes("task", entity="transfer")).values()))
+        await drive(a, 0, task["id"], "complete")
+    else:
+        await e.accept("completed", event, "new-watch", iso_time(clock[0]))
+        await e.drain(0)
+    before = len(requests)
+    await a.automatic("marked_unplayed", event, "late-unmark", older)
+    task = list((await store.scopes("task", entity="transfer")).values())[-1]
+    result = await drive(a, 0, task["id"], "complete")
+    assert result["skipped"] == 1 and len(requests) == before

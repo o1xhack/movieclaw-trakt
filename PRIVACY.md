@@ -20,6 +20,6 @@ Retries use two read-only host metadata operations (`library.list`, `library.ite
 
 三个实时同步偏好在每个成员的插件 profile 中保存，默认关闭。开启后，手动标记向 Trakt 写入观看日期，手动取消已看删除对应电影／单集的全部 Trakt 观看记录，新增收藏加入 Watchlist。取消收藏不移除 Watchlist。
 
-管理员在独立历史页手动扫描，经完整预览和 Confirm 后，网页逐批读取或写入。`playback.sync.catalog` 读取所选成员可见的库内影片、单集及观看事实；`playback.sync.import` 将匹配的 Trakt 原日期和重看事实导入所选成员。插件保存扫描计划、标题、日期、批次状态及去重回执供 History 查询；这些批次不属于最近 80 条活动的容量限制，断开账号后保留用于核对，但旧任务无法写入新绑定。另保存按成员、条目编号哈希与绑定代次隔离的取消已看时间标记，防止旧播放事件覆盖较新的取消操作；不包含文件路径或凭据。无文件系统权限，不读写视频。
+管理员在独立历史页手动扫描，经完整预览和 Confirm 后，网页逐批读取或写入。`playback.sync.catalog` 读取所选成员可见的库内影片、单集及观看事实；`playback.sync.import` 将匹配的 Trakt 原日期和重看事实导入所选成员。插件保存扫描计划、标题、日期、批次状态及去重回执供 History 查询；这些批次不属于最近 80 条活动的容量限制，断开账号后保留用于核对，但旧任务无法写入新绑定。另保存按成员、条目编号哈希与绑定代次隔离的取消已看及最近成功观看时间标记，防止旧事件或旧重试覆盖较新的操作；不包含文件路径或凭据。无文件系统权限，不读写视频。
 
 The three member-scoped preferences default off. Enabled manual unwatched actions remove all Trakt watches for the selected movie/episode; new favorites add to Watchlist. Administrator-triggered history transfers read local holdings/watch facts and Trakt history, preserve original dates/rewatches, and import only matched local units after preview and Confirm. Plans, titles, dates, batch outcomes and deduplication receipts persist separately from the bounded activity feed; disconnect retains this audit history while preventing old tasks from writing through a new binding. No filesystem access is granted.
