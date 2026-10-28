@@ -9,12 +9,15 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from trakt_sync.actions import Actions
 from trakt_sync.client import TraktClient
 from trakt_sync.engine import Engine
 from trakt_sync.policy import iso_time
+from trakt_sync.preferences import Preferences
 from trakt_sync.transfers import Transfers
 
 from .conftest import Health, Store
+from .test_actions import drive as drive_actions
 from .test_host_contract import host as host
 from .test_host_contract import seed
 from .test_trakt_minutes import MinuteService
@@ -23,8 +26,8 @@ from .test_transfers import drive
 pytestmark = pytest.mark.skipif(os.getenv("MOVIECLAW_HOST_QA") != "1", reason="isolated host QA")
 
 
-@pytest.mark.parametrize("export_first", [False, True])
-def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeypatch, export_first):
+@pytest.mark.parametrize("order", ["native_first", "export_first", "export_only"])
+def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeypatch, order):
     from movieclaw_api.services import durable_events
     from movieclaw_api.services.host_ops import HostOps
     from movieclaw_db.engine import get_database
@@ -48,17 +51,17 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
 
     async def scenario():
         async with get_database().session() as s:
-            s.add(
+            s.add_all(
                 EventConsumer(
-                    consumer_id="fixture-source",
-                    event_name="playback.completed",
-                    event_names=["playback.completed"],
+                    consumer_id=f"fixture-source:{name}", event_name=name, event_names=[name]
                 )
+                for name in ("playback.completed", "playback.marked_unplayed")
             )
             await s.commit()
         durable_events.reset_subscribed()
-        service, native = MinuteService(), []
-        lose_export = export_first
+        service, native, removals = MinuteService(), [], []
+        export_first = order != "native_first"
+        lose_export = order == "export_first"
 
         def dispatch(request):
             nonlocal lose_export
@@ -66,6 +69,10 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 native.append(json.loads(request.content))
                 service.seed({"movie": {"ids": {"tmdb": 11}}}, iso_time(now()))
                 return httpx.Response(201, json={"action": "scrobble"})
+            if request.url.path == "/sync/history/remove":
+                removals.append(1)
+                service.rows["movies"].clear()
+                return httpx.Response(200, json={"deleted": {"movies": 1}})
             response = service(request)
             if request.url.path == "/sync/history" and request.method == "POST" and lose_export:
                 lose_export = False
@@ -92,6 +99,14 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 )
                 assert r.status_code == 200, r.text
 
+            # Keep an actual older unwatch event undispatched until after a newer export.
+            for minute, played in ((10, True), (19, False)):
+                clock[0] = datetime(2020, 1, 1, 12, minute)
+                marked = await web.post(
+                    "/api/v1/playback/marks", json={"media_item_id": item_id, "played": played}
+                )
+                assert marked.status_code == 200, marked.text
+            clock[0] = datetime(2020, 1, 1, 12, 20)
             await report("start")
             clock[0] = datetime(2020, 1, 1, 12, 34, 59)
             await report("progress", 570_000)
@@ -153,7 +168,7 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 task = await drive(transfers, await transfers.create(0, "export"), "ready")
                 assert task["total"] == int(export_first)
                 await transfers.confirm(0, task["id"], task["preview_token"])
-                if export_first:
+                if order == "export_first":
                     await transfers.step(task["id"], 0)
                     restored = Engine(store, engine.client, engine.health, engine.log, clock=now)
                     await restored.accept("completed", payload, event_id, occurred_at)
@@ -172,6 +187,24 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 assert not await restored.source_delivery(
                     0, "another-binding", {"movie": {"ids": {"tmdb": 11}}}, source_id
                 )
+                async with get_database().session() as s:
+                    unwatch = (
+                        await s.execute(
+                            select(DomainEvent).where(
+                                DomainEvent.name == "playback.marked_unplayed"
+                            )
+                        )
+                    ).scalar_one()
+                    unwatch_payload, unwatch_id = unwatch.payload, unwatch.id
+                    unwatch_at = unwatch.occurred_at.isoformat() + "Z"
+                assert unwatch_at.startswith("2020-01-01T12:19:00")
+                await restored.set(0, "profile", Preferences(manual_unwatched=True).model_dump())
+                actions = Actions(restored)
+                await actions.automatic("marked_unplayed", unwatch_payload, unwatch_id, unwatch_at)
+                removal = list((await store.scopes("task", entity="transfer")).values())[-1]
+                result = await drive_actions(actions, 0, removal["id"], "complete")
+                assert result["skipped"] == 1 and not removals
+                assert len(service.rows["movies"]) == 1
             finally:
                 for fn in cleanup:
                     fn()

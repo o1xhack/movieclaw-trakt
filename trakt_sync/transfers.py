@@ -119,11 +119,18 @@ class Transfers:
             raise ValueError("Trakt 授权失效，请重新连接")
         return await self.e.authorized(task["member_id"], account, method, path, body, params)
 
+    async def remember_export_watch(self, task, row, watched_at):
+        await self.e.remember_watch(
+            task["member_id"], task["generation"], item(row), row["media"]["id"], watched_at
+        )
+
     async def receipt(self, task, row, write=False, merged=False):
         scope = f"synced:{task['member_id']}-{task['generation']}"
         key = fingerprint(task["direction"], row)
         if write:
             if task["direction"] == "export":
+                if not merged:
+                    await self.remember_export_watch(task, row, row["watched_at"])
                 await self.e.remember_source_delivery(
                     task["member_id"],
                     task["generation"],
@@ -137,6 +144,8 @@ class Transfers:
             saved = await self.store.get(key, scope=scope, default=False)
             if saved:
                 if task["direction"] == "export":
+                    if saved is True:
+                        await self.remember_export_watch(task, row, row["watched_at"])
                     await self.e.remember_source_delivery(
                         task["member_id"],
                         task["generation"],
@@ -162,6 +171,7 @@ class Transfers:
             if delivered and delivered["state"] == "sent":
                 if delivered.get("export"):
                     export = delivered["export"]
+                    await self.remember_export_watch(task, row, export["watched_at"])
                     await self.store.set(
                         minute_key({**row, "watched_at": export["watched_at"]}),
                         export["owner"],

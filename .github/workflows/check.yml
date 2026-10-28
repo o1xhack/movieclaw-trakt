@@ -9,8 +9,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: o1xhack/movieclaw
-          ref: fb8b05cd32ad2011affc329601af8a8f7956273b # proposed upstream #1063; unreleased
+          repository: movieclaw/MovieClaw
+          ref: 6f0ca5224837d5962ad68a8d047ff8721831c4a9 # merged upstream #1063; unreleased
           path: .sdk
       - uses: actions/setup-python@v5
         with:
@@ -34,8 +34,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: o1xhack/movieclaw
-          ref: fb8b05cd32ad2011affc329601af8a8f7956273b # proposed upstream #1063; unreleased
+          repository: movieclaw/MovieClaw
+          ref: 6f0ca5224837d5962ad68a8d047ff8721831c4a9 # merged upstream #1063; unreleased
           path: .sdk
       - uses: actions/setup-python@v5
         with:

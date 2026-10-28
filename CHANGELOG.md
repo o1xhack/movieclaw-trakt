@@ -5,7 +5,8 @@
 - Share durable source receipts between real-time completions and history export using the watch-log IDs proposed in upstream MovieClaw #1063. Keep each member, binding and media identity separate; receipts remain valid when the catalog stop timestamp or resume-group anchor changes.
 - Persist approved export intents before remote reconciliation, so late native events recover the same explicit minute after a lost export response or receipt. Preserve exported-minute ownership across aliases and interrupted merge accounting.
 - Wait for pending delivery of the same source before exporting; late native events reuse successful export receipts. Preserve skipped same-minute outcomes and persist receipts before removing delivery intent.
-- Require playback.stopped/completed contracts ^1.1. This beta depends on the unmerged/unreleased upstream proposal; official v0.43.0 is insufficient. Stable main and market remain 0.2.3, with no production update.
+- Record successfully reconciled exports in the watch/unwatch ordering barrier before committing receipts. Restore it from fingerprint/shared receipts, including native recovery of an export intent, using precise original source times so delayed older removals cannot erase newer exported watches.
+- Require playback.stopped/completed contracts ^1.1. Upstream #1063 is merged and pinned at its official merge commit, pending a formal release; official v0.43.0 is insufficient. Stable main and market remain 0.2.3, with no production update.
 
 ## 0.3.0-beta.2 (unreleased)
 

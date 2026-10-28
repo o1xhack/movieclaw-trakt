@@ -1008,12 +1008,15 @@ class Engine(ActivityLog, Recovery):
                 "local_deleted",
                 "manual_unwatched",
             }:
+                watched_at = job["occurred_at"]
+                if delivered and delivered.get("export"):
+                    watched_at = max(watched_at, delivered["export"]["watched_at"], key=timestamp)
                 await self.remember_watch(
                     member,
                     account["generation"],
                     job["item"],
                     job.get("source", {}).get("media_id"),
-                    job["occurred_at"],
+                    watched_at,
                 )
                 if result.get("action") in {"scrobble", "already_synced", "minute_merged"} or (
                     job["path"] == "/sync/history" and isinstance(result.get("added"), dict)
