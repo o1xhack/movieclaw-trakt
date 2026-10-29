@@ -261,3 +261,91 @@ async def test_authorization_keeps_tokens_and_privately_caches_valid_uuid(harnes
     assert account["identity_version"] == 1 and account["access_token"] == "fixture-access"
     assert account.get("user_uuid") == (UUID if user and user.get("ids") else None)
     assert UUID not in str(await e.status(0))
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("username", ["legacy-user", None])
+async def test_disconnect_migrates_beta_history_before_rebinding_without_another_scan(
+    harness, kind, username
+):
+    e, _, clock, _ = await harness(api({}))
+    account = await e.get(0, "account")
+    account["username"] = username
+    await e.set(0, "account", account, secret=True)
+    await e.set(0, "import_stamp", {"generation": account["generation"]})
+    u = unit(kind=kind, season=int(kind == "tv"), episode=int(kind == "tv"), played=False)
+    ops = Ops([u])
+    await ops.call(
+        "playback.sync.import",
+        {
+            "records": [
+                {
+                    "media_item_id": 1,
+                    "season": u["season"],
+                    "episode": u["episode"],
+                    "source_id": digest([username or account["generation"], 1]),
+                    "watched_at": "2020-01-01T00:00:00Z",
+                    "expected_updated_at": None,
+                }
+            ]
+        },
+    )
+    update_catalog_version(ops)
+    # Upgrade, then disconnect/reconnect immediately. No post-upgrade scan first.
+    assert (await e.disconnect(0))["disconnected"]
+    await connect(e)
+    await import_all(e, ops, clock)
+    assert len(ops.writes) == 1
+
+
+@pytest.mark.parametrize("failure", ["network", "storage"])
+async def test_disconnect_retains_beta_binding_until_identity_is_durable(
+    harness, monkeypatch, failure
+):
+    profile = {"status": 503 if failure == "network" else 200}
+    e, store, _, requests = await harness(api(profile))
+    account = await e.get(0, "account")
+    account["username"] = "legacy-retained"
+    await e.set(0, "account", account, secret=True)
+    # Partial legacy imports can lack the completed import_stamp.
+    await store.set(
+        "task",
+        {
+            "id": "old-partial",
+            "member_id": 0,
+            "direction": "import",
+            "generation": account["generation"],
+            "confirmed_at": "2020-01-01T00:00:00Z",
+            "state": "paused",
+            "total": 3,
+        },
+        scope="history:old-partial",
+    )
+    original = store.set
+    interrupted = []
+
+    async def persist(key, value, **kwargs):
+        if failure == "storage" and not interrupted and key.startswith("import_identity_"):
+            interrupted.append(key)
+            raise OSError("registry unavailable")
+        return await original(key, value, **kwargs)
+
+    monkeypatch.setattr(store, "set", persist)
+    result = await e.disconnect(0)
+    assert not result["disconnected"] and result["import_identity_pending"]
+    assert await e.get(0, "account") == account
+    assert not [r for r in requests if r.url.path == "/oauth/revoke"]
+    profile["status"] = 200
+    assert (await e.disconnect(0))["disconnected"]
+    assert not await e.get(0, "account")
+
+
+async def test_only_explicit_reset_allows_disconnect_with_unresolved_legacy_identity(harness):
+    e, _, _, requests = await harness(api({"status": 401}))
+    account = await e.get(0, "account")
+    await e.set(0, "import_stamp", {"generation": account["generation"]})
+    # An unavailable/revoked legacy authorization must not permanently trap the user.
+    assert not (await e.disconnect(0))["disconnected"]
+    result = await e.disconnect(0, allow_legacy_identity_loss=True)
+    assert result["disconnected"] and not await e.get(0, "account")
+    assert any(r.url.path == "/oauth/revoke" for r in requests)

@@ -231,6 +231,17 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                 # host's existing source IDs, even without receipts for this generation.
                 account = await e.get(2, "account")
                 assert account["user_uuid"] == "fixture-two-uuid"
+                # A beta binding can be reconnected before any post-upgrade scan.
+                from trakt_sync.transfers import digest
+
+                legacy = {
+                    k: v for k, v in account.items() if k not in {"identity_version", "user_uuid"}
+                }
+                await e.set(2, "account", legacy, secret=True)
+                await store.delete(
+                    "import_identity_" + digest(account["user_uuid"]), scope="member:2"
+                )
+                assert (await e.disconnect(2))["disconnected"]
                 await e.set(
                     2,
                     "account",
@@ -266,7 +277,9 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     if exported["state"] == "complete":
                         break
                 assert exported["done"] == 3
-                assert not [r for r in requests if r.method == "POST"]
+                assert not [
+                    r for r in requests if r.method == "POST" and r.url.path.startswith("/sync/")
+                ]
                 # Real identity correction + cleanup must retain every imported watch and source key.
                 async with get_database().session() as s:
                     corrected = MediaItem(
@@ -319,7 +332,9 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                         break
                 assert corrected_export["done"] == 3
                 posted = [
-                    json.loads(r.content)["movies"][0] for r in requests if r.method == "POST"
+                    json.loads(r.content)["movies"][0]
+                    for r in requests
+                    if r.method == "POST" and r.url.path == "/sync/history"
                 ]
                 assert len(posted) == 3 and all(r["ids"]["tmdb"] == 12 for r in posted)
                 assert {r["watched_at"][:10] for r in posted} == {
@@ -369,7 +384,11 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                         else:
                             raise AssertionError(tasks)
                         assert all(v["member_id"] == 2 for v in tasks)
-                        assert all(r.headers["Authorization"] == "Bearer fixture" for r in requests)
+                        assert all(
+                            r.headers["Authorization"] == "Bearer fixture"
+                            for r in requests
+                            if r.url.path != "/oauth/revoke"
+                        )
                 # Trakt episode rewatches arrive at minute precision, independently of season sentinels.
                 async with get_database().session() as s:
                     show = MediaItem(
