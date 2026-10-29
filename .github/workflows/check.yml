@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: movieclaw/MovieClaw
-          ref: 6f0ca5224837d5962ad68a8d047ff8721831c4a9 # merged upstream #1063; unreleased
+          ref: 2a6e6d2a58129a305e53f78639e7dafd82a1ec82 # official v0.44.0
           path: .sdk
       - uses: actions/setup-python@v5
         with:
@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: movieclaw/MovieClaw
-          ref: 6f0ca5224837d5962ad68a8d047ff8721831c4a9 # merged upstream #1063; unreleased
+          ref: 2a6e6d2a58129a305e53f78639e7dafd82a1ec82 # official v0.44.0
           path: .sdk
       - uses: actions/setup-python@v5
         with:

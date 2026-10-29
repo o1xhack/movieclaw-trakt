@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 (2026-10-29)
+
+- Target official MovieClaw Server v0.44.0, including the shared watch-source IDs from upstream #1063. Earlier servers without playback stopped/completed contracts 1.1 cannot install this version.
+- Add independent, default-off preferences for manual watched, manual unwatched and new favorites to Trakt Watchlist. Preserve existing accounts and preferences on same-ID updates; ratings and member self-service are not included.
+- Add a separate foreground history page: scan local holdings or paginated Trakt history, review movie/per-season counts, explicitly confirm, then process resumable batches. Opening the page never starts or resumes a transfer.
+- Preserve API-returned import times and local source precision. Trakt history uses UTC minutes; disclose same-minute collisions instead of reporting them as distinct successful watches.
+- Share durable receipts across real-time delivery and history export, including response loss, process recovery and resume-source aliases. Protect newer watches from delayed unwatch events and preserve incremental imports after cutoff exclusions.
+- Retain stable metadata correction, retry/dismissal controls and activity filters. No filesystem access, additional server port or automatic bulk synchronization.
+
 ## 0.3.0-beta.3 (unreleased)
 
 - Share durable source receipts between real-time completions and history export using the watch-log IDs proposed in upstream MovieClaw #1063. Keep each member, binding and media identity separate; receipts remain valid when the catalog stop timestamp or resume-group anchor changes.

@@ -1,8 +1,8 @@
 # Technical and maintenance notes
 
-## 0.3 candidate
+## Version 0.3
 
-This unreleased 0.3.0-beta.2 candidate targets official v0.43.0. Four host operations cover metadata reads, watch catalog and dated imports, with no filesystem permission. Manual actions and confirmed foreground history use separate durable plans; the playback-ledger limits below do not bound those plans. Terminal item errors do not block later actions. See the [workflow](sync-workflow.zh-CN.md).
+Version 0.3.0 targets official v0.44.0 and requires stopped/completed event contracts 1.1. Four host operations cover metadata reads, watch catalog and dated imports, with no filesystem permission. Manual actions and confirmed foreground history use separate durable plans; the playback-ledger limits below do not bound those plans. Terminal item errors do not block later actions. See the [workflow](sync-workflow.zh-CN.md).
 
 Install and update through **Settings → Plugins → Plugin Market**, as described in the [README](../README.en.md). Users are not asked to switch server branches. The manifest requests playback events, network and plugin storage, without media deletion or media-file access.
 
