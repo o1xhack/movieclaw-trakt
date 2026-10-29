@@ -74,6 +74,16 @@ async def harness():
                     return result
             if request.method == "GET" and request.url.path.startswith("/sync/history/"):
                 return httpx.Response(200, json=[])
+            if request.url.path == "/users/settings":
+                return httpx.Response(
+                    200,
+                    json={
+                        "user": {
+                            "username": "fixture-user",
+                            "ids": {"uuid": "fixture-stable-user-uuid"},
+                        }
+                    },
+                )
             return httpx.Response(201, json={"action": "scrobble"})
 
         http = httpx.AsyncClient(transport=httpx.MockTransport(dispatch))

@@ -74,6 +74,10 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
 
     def dispatch(r):
         requests.append(r)
+        if r.url.path == "/users/settings":
+            return httpx.Response(
+                200, json={"user": {"username": "fixture-two", "ids": {"uuid": "fixture-two-uuid"}}}
+            )
         if r.url.path == "/sync/last_activities":
             return httpx.Response(200, json={"movies": {"watched_at": "2020-01-04T00:00:00Z"}})
         if r.method == "GET" and r.url.path == "/sync/history/movies":
@@ -223,6 +227,30 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     )
                 data = await call(f"/{task['id']}?records=true")
                 assert len(data["items"]) == 3
+                # New binding and a renamed display username must still hit the real
+                # host's existing source IDs, even without receipts for this generation.
+                account = await e.get(2, "account")
+                assert account["user_uuid"] == "fixture-two-uuid"
+                await e.set(
+                    2,
+                    "account",
+                    {**account, "generation": "rebound-fixture", "username": "renamed-fixture"},
+                    secret=True,
+                )
+                rebound = await call("", "POST", {"direction": "import"})
+                for _ in range(10):
+                    rebound = await call(f"/{rebound['id']}/tick", "POST")
+                    if rebound["state"] == "ready":
+                        break
+                assert rebound["state"] == "ready" and rebound["total"] == 3
+                await call(f"/{rebound['id']}/confirm", "POST", {"token": rebound["preview_token"]})
+                for _ in range(10):
+                    rebound = await call(f"/{rebound['id']}/tick", "POST")
+                    if rebound["state"] == "complete":
+                        break
+                assert rebound["state"] == "complete" and rebound["done"] == 3
+                async with get_database().session() as s:
+                    assert len(list((await s.execute(select(WatchRecord))).scalars())) == 3
                 # Matching imported rewatches can be exported, and existing Trakt facts are not re-posted.
                 exported = await call("", "POST", {"direction": "export"})
                 for _ in range(10):
