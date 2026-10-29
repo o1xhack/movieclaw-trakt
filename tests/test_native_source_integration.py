@@ -26,12 +26,12 @@ from .test_transfers import drive
 pytestmark = pytest.mark.skipif(os.getenv("MOVIECLAW_HOST_QA") != "1", reason="isolated host QA")
 
 
-@pytest.mark.parametrize("order", ["native_first", "export_first", "export_only"])
+@pytest.mark.parametrize("order", ["native_first", "export_first", "export_only", "export_merged"])
 def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeypatch, order):
     from movieclaw_api.services import durable_events
     from movieclaw_api.services.host_ops import HostOps
     from movieclaw_db.engine import get_database
-    from movieclaw_db.models import DomainEvent, EventConsumer
+    from movieclaw_db.models import DomainEvent, EventConsumer, WatchRecord
     from movieclaw_sdk.events import PLAYBACK_COMPLETED
     from sqlalchemy import select
 
@@ -60,6 +60,7 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
             await s.commit()
         durable_events.reset_subscribed()
         service, native, removals = MinuteService(), [], []
+        merged = order == "export_merged"
         export_first = order != "native_first"
         lose_export = order == "export_first"
 
@@ -100,8 +101,8 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 assert r.status_code == 200, r.text
 
             # Keep an actual older unwatch event undispatched until after a newer export.
-            for minute, played in ((10, True), (19, False)):
-                clock[0] = datetime(2020, 1, 1, 12, minute)
+            for minute, played in ((10, True), (45 if merged else 19, False)):
+                clock[0] = datetime(2020, 1, 1, 12, minute, 30 if merged and not played else 0)
                 marked = await web.post(
                     "/api/v1/playback/marks", json={"media_item_id": item_id, "played": played}
                 )
@@ -146,6 +147,21 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 await engine.drain(0)
             clock[0] = datetime(2020, 1, 1, 12, 45)
             await report("stop", 600_000)
+            if merged:
+                async with get_database().session() as s:
+                    when = datetime(2020, 1, 1, 12, 45, 59)
+                    s.add(
+                        WatchRecord(
+                            member_id=0,
+                            media_item_id=item_id,
+                            source="fixture",
+                            source_id="second-same-minute-watch",
+                            watched_at=when,
+                            state_version=when,
+                        )
+                    )
+                    await s.commit()
+                clock[0] = datetime(2020, 1, 1, 12, 46)
             # Use the actual granted HostOps gateway, without the HTTP fixture login override.
             app.dependency_overrides.clear()
             ops = HostOps(app)
@@ -166,7 +182,7 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 restored = Engine(store, engine.client, engine.health, engine.log, clock=now)
                 transfers = Transfers(restored, gateway)
                 task = await drive(transfers, await transfers.create(0, "export"), "ready")
-                assert task["total"] == int(export_first)
+                assert task["total"] == int(export_first) + int(merged)
                 await transfers.confirm(0, task["id"], task["preview_token"])
                 if order == "export_first":
                     await transfers.step(task["id"], 0)
@@ -175,7 +191,11 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                     await restored.drain(0)
                     transfers = Transfers(restored, gateway)
                     clock[0] = datetime(2020, 1, 1, 12, 50)
-                await drive(transfers, task, "complete")
+                done = await drive(
+                    transfers, task, "complete_with_errors" if merged else "complete"
+                )
+                if merged:
+                    assert done["done"] == 1 and done["skipped"] == 1
                 assert len(native) == int(not export_first)
                 assert len(service.posts) == int(export_first)
                 assert service.rows["movies"][0]["watched_at"] == (
@@ -197,7 +217,9 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                     ).scalar_one()
                     unwatch_payload, unwatch_id = unwatch.payload, unwatch.id
                     unwatch_at = unwatch.occurred_at.isoformat() + "Z"
-                assert unwatch_at.startswith("2020-01-01T12:19:00")
+                assert unwatch_at.startswith(
+                    "2020-01-01T12:45:30" if merged else "2020-01-01T12:19:00"
+                )
                 await restored.set(0, "profile", Preferences(manual_unwatched=True).model_dump())
                 actions = Actions(restored)
                 await actions.automatic("marked_unplayed", unwatch_payload, unwatch_id, unwatch_at)

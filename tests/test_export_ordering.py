@@ -120,3 +120,69 @@ async def test_native_reconciled_export_marks_its_actual_source_time(harness, ki
     assert (await drive_actions(actions, 0, unwatch["id"], "complete"))["skipped"] == 1
     assert len(service.posts) == 1
     assert not [r for r in requests if r.url.path in {"/scrobble/stop", "/sync/history/remove"}]
+
+
+@pytest.mark.parametrize("kind", ["movie", "tv"])
+@pytest.mark.parametrize("recovery", ["normal", "fingerprint", "alias", "barrier_failure"])
+async def test_minute_merged_export_keeps_precise_ordering_and_skipped_accounting(
+    harness, monkeypatch, kind, recovery
+):
+    first, later = "2020-01-01T12:34:01Z", "2020-01-01T12:34:59Z"
+    row, service = local(kind, first), MinuteService()
+    second = {"id": "playback:second-watch", "watched_at": later, "basis": "playback"}
+    row["watches"].append(second)
+    engine, store, clock, requests = await harness(service)
+    clock[0] = timestamp("2020-01-01T12:50:00Z")
+    await engine.set(0, "profile", Preferences(manual_unwatched=True).model_dump())
+    interrupted = []
+    if recovery == "barrier_failure":
+        original = store.set
+
+        async def fail_later_marker(key, value, **kwargs):
+            if key.startswith("watch_") and value.get("at") == later and not interrupted:
+                interrupted.append(key)
+                raise OSError("merged watch ordering marker interrupted")
+            return await original(key, value, **kwargs)
+
+        monkeypatch.setattr(store, "set", fail_later_marker)
+    t = Transfers(engine, Ops([row]))
+    task = await drive(t, await t.create(0, "export"), "ready")
+    assert task["total"] == 2 and task["minute_collisions"] == 1
+    await t.confirm(0, task["id"], task["preview_token"])
+    await t.step(task["id"], 0)
+    if recovery == "barrier_failure":
+        assert interrupted and (await t.get(0, task["id"]))["next_at"] > clock[0]
+        clock[0] += 120
+        engine = Engine(store, engine.client, engine.health, engine.log, clock=engine.clock)
+        t = Transfers(engine, Ops([row]))
+    done = await drive(t, task, "complete_with_errors")
+    assert done["done"] == 1 and done["skipped"] == 1 and len(service.posts) == 1
+    if recovery in {"fingerprint", "alias"}:
+        # Old merged receipts existed without their ordering barrier. Restore an
+        # earlier barrier, then exercise incremental receipt recovery.
+        for key in engine.unwatch_keys(target(row), row["media"]["id"], prefix="watch"):
+            await engine.set(0, key, {"generation": "fixture-generation", "at": first})
+        if recovery == "fingerprint":
+            await store.delete(
+                engine.source_key("fixture-generation", second["id"]), scope="member:0"
+            )
+        else:
+            second["source_ids"] = [second["id"], "playback:new-alias"]
+            second.update(id="playback:new-alias", watched_at="2020-01-01T12:45:00Z")
+        again = await drive(t, await t.create(0, "export"), "ready")
+        assert again["total"] == 0
+        await t.confirm(0, again["id"], again["preview_token"])
+        await drive(t, again, "complete")
+    actions = Actions(engine)
+    event = {"member_id": 0, "media": row["media"], "units": [row]}
+    await actions.automatic("marked_unplayed", event, "between-watches", "2020-01-01T12:34:30Z")
+    older = list((await store.scopes("task", entity="transfer")).values())[-1]
+    assert (await drive_actions(actions, 0, older["id"], "complete"))["skipped"] == 1
+    assert not [r for r in requests if r.url.path == "/sync/history/remove"]
+    # Source aliases must not inflate the barrier to the later catalog timestamp.
+    await actions.automatic(
+        "marked_unplayed", event, "after-both-watches", "2020-01-01T12:34:59.000001Z"
+    )
+    newer = list((await store.scopes("task", entity="transfer")).values())[-1]
+    assert (await drive_actions(actions, 0, newer["id"], "complete"))["done"] == 1
+    assert len([r for r in requests if r.url.path == "/sync/history/remove"]) == 1
