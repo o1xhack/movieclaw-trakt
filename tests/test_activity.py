@@ -143,3 +143,25 @@ async def test_missing_media_id_is_visible_as_skipped_without_sending(harness, e
     row = (await e.activity(0))["records"][0]
     assert row["state"] == "skipped" and "外部编号" in row["reason"]
     assert requests == []
+
+
+async def test_playback_noise_cannot_evict_watched_and_favorite_records(harness):
+    e, _, clock, _ = await harness()
+    await e.record_activity(
+        0,
+        "manual",
+        event="marked_played",
+        title="电影",
+        state="sent",
+        occurred_at=iso_time(clock[0]),
+    )
+    await e.record_activity(
+        0, "favorite", event="favorited", title="电影", state="sent", occurred_at=iso_time(clock[0])
+    )
+    for n in range(100):
+        await e.record_activity(
+            0, f"noise-{n}", event="started", state="sent", occurred_at=iso_time(clock[0])
+        )
+    rows = (await e.activity(0))["records"]
+    assert {"manual", "favorite"}.issubset({r["id"] for r in rows})
+    assert len(rows) == 2  # Heartbeats are hidden; important records remain.

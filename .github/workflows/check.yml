@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: movieclaw/MovieClaw
-          ref: bd325adde24e5e035878d3fb668cd0b004c96760 # v0.42.0
+          ref: 2a6e6d2a58129a305e53f78639e7dafd82a1ec82 # official v0.44.0
           path: .sdk
       - uses: actions/setup-python@v5
         with:
@@ -20,8 +20,29 @@ jobs:
       - run: python -m pytest -q
         env:
           PYTHONPATH: .sdk/src
+      - run: node --test tests/*web.test.cjs
+      - run: node --check web/app.js
+      - run: node --check web/history.js
       - run: python scripts/package.py
       - uses: actions/upload-artifact@v4
         with:
           name: trakt-sync
           path: dist/*
+  matched-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: movieclaw/MovieClaw
+          ref: 2a6e6d2a58129a305e53f78639e7dafd82a1ec82 # official v0.44.0
+          path: .sdk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt -e .sdk
+      - run: bash .sdk/scripts/export-spec.sh
+      - run: python -m pytest tests/test_history_integration.py tests/test_host_contract.py tests/test_native_source_integration.py -q
+        env:
+          PYTHONPATH: .sdk/src
+          MOVIECLAW_HOST_QA: '1'

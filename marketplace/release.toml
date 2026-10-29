@@ -1,4 +1,5 @@
 # 发布前显式填写已兼容的 MovieClaw Server 正式版；不是最低版本声明。
 # 先演练。配置 MARKETPLACE_PR_TOKEN 并完成验证后，再改成 true。
 enabled = false
-movieclaw_release = "v0.42.0"
+# 0.3.0 使用正式 v0.44.0 的事件 1.1 契约；自动提交仍需单独配置专用凭据。
+movieclaw_release = "v0.44.0"
