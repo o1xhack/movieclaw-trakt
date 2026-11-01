@@ -507,6 +507,19 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     if native_export["state"] == "complete":
                         break
                 assert native_export["state"] == "complete"
+                # Real HTTP route defaults to incremental and reuses persisted legacy history.
+                followup = await call("", "POST", {"direction": "export"})
+                assert followup["mode"] == "incremental"
+                assert followup["since"] == native_export["cutoff"]
+                await call(f"/{followup['id']}/cancel", "POST")
+                full = await call("", "POST", {"direction": "export", "mode": "full"})
+                assert full["mode"] == "full" and full["since"] is None
+                for _ in range(10):
+                    full = await call(f"/{full['id']}/tick", "POST")
+                    if full["state"] == "ready":
+                        break
+                assert full["state"] == "ready" and full["total"] == 0
+                await call(f"/{full['id']}/cancel", "POST")
                 native_posts = [
                     json.loads(r.content)["movies"][0]
                     for r in requests
