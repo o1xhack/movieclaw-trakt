@@ -508,3 +508,115 @@ async def test_export_rejects_identity_corrected_after_preview(harness, kind):
     result = await t.step(task["id"], 0)
     assert result["state"] == "complete_with_errors" and result["skipped"] == 1
     assert not requests  # Never even query history for the obsolete external identity.
+
+
+async def test_incremental_uses_successful_legacy_cutoff_and_isolates_account(harness):
+    e, store, clock, _ = await harness()
+    t = Transfers(e, Ops([]))
+    first = await drive(t, await t.create(0, "export"), "ready")
+    await t.confirm(0, first["id"], first["preview_token"])
+    first = await drive(t, first, "complete")
+    # Upgrade from a batch written before mode/since existed; a reload retains progress.
+    first.pop("mode")
+    first.pop("since")
+    await t.save(first)
+    clock[0] += 120
+    t = Transfers(e, Ops([]))
+    incremental = await t.create(0, "export")
+    assert incremental["mode"] == "incremental"
+    assert incremental["since"] == first["cutoff"]
+    await t.control(0, incremental["id"], "cancel")
+    failed = await t.get(0, incremental["id"])
+    failed["state"] = "complete_with_errors"
+    await t.save(failed)
+    clock[0] += 120
+    again = await t.create(0, "export")
+    assert again["since"] == first["cutoff"]  # Failed or cancelled scans cannot advance progress.
+    await t.control(0, again["id"], "cancel")
+    full = await t.create(0, "export", "full")
+    assert full["since"] is None
+    await t.control(0, full["id"], "cancel")
+    other_direction = await t.create(0, "import")
+    assert other_direction["since"] is None
+    await t.control(0, other_direction["id"], "cancel")
+    account = await e.get(0, "account")
+    account["generation"] = "new-binding"
+    await e.set(0, "account", account)
+    assert (await t.create(0, "export"))["since"] is None
+    with pytest.raises(ValueError, match="同步模式"):
+        await t.create(0, "export", "invalid")
+
+
+async def test_incremental_remote_range_and_explicit_full_bypasses_activity_cache(harness):
+    stamp = {"movies": {"watched_at": "2020-01-01T00:00:00Z"}}
+    rows = []
+
+    def handler(r):
+        if r.url.path == "/sync/last_activities":
+            return httpx.Response(200, json=stamp)
+        if r.url.path == "/sync/history/movies":
+            # Model the server's start_at filtering, rather than ignoring query parameters.
+            start = r.url.params.get("start_at", "")
+            return httpx.Response(
+                200,
+                json=[v for v in rows if v["watched_at"] >= start],
+                headers={"X-Pagination-Page-Count": "1"},
+            )
+        if r.url.path == "/sync/history/episodes":
+            return httpx.Response(200, json=[])
+
+    e, _, clock, requests = await harness(handler)
+    clock[0] = 1761696015  # 2025-10-29 00:00:15 UTC, boundary minute retained.
+    ops = Ops([unit(played=False)])
+    t = Transfers(e, ops)
+    first = await drive(t, await t.create(0, "import"), "ready")
+    await t.confirm(0, first["id"], first["preview_token"])
+    await drive(t, first, "complete")
+    rows.extend(
+        [
+            remote(1, when=iso_time(clock[0] + 60), history_id=2),
+            remote(1, when="2020-01-01T00:00:00Z", history_id=3),
+        ]
+    )
+    stamp["movies"]["watched_at"] = iso_time(clock[0] + 60)
+    clock[0] += 120
+    requests.clear()
+    t = Transfers(e, ops)
+    inc = await drive(t, await t.create(0, "import"), "ready")
+    assert inc["since"] == first["cutoff"] and inc["total"] == 1
+    remote_requests = [r for r in requests if r.url.path.startswith("/sync/history/")]
+    assert remote_requests and all(
+        r.url.params["start_at"] == iso_time(1761696000) for r in remote_requests
+    )
+    await t.confirm(0, inc["id"], inc["preview_token"])
+    await drive(t, inc, "complete")
+    requests.clear()
+    full = await drive(t, await t.create(0, "import", "full"), "ready")
+    assert full["total"] == 1  # Backdated remote addition is found by an explicit full scan.
+    remote_requests = [r for r in requests if r.url.path.startswith("/sync/history/")]
+    assert remote_requests and all("start_at" not in r.url.params for r in remote_requests)
+
+
+async def test_inventory_change_reopens_old_unmatched_remote_history(harness):
+    stamp = {"movies": {"watched_at": "2020-01-01T00:00:00Z"}}
+
+    def handler(r):
+        if r.url.path == "/sync/last_activities":
+            return httpx.Response(200, json=stamp)
+        if r.url.path == "/sync/history/movies":
+            return httpx.Response(200, json=[remote(2)], headers={"X-Pagination-Page-Count": "1"})
+
+    e, _, clock, requests = await harness(handler)
+    ops = Ops([unit(played=False)])
+    t = Transfers(e, ops)
+    first = await drive(t, await t.create(0, "import"), "ready")
+    assert first["unmatched"] == 1 and first["total"] == 0
+    await t.confirm(0, first["id"], first["preview_token"])
+    await drive(t, first, "complete")
+    clock[0] += 120
+    ops.units.append(unit(2, played=False))
+    requests.clear()
+    task = await drive(t, await t.create(0, "import"), "ready")
+    assert task["since"] is None and task["range_reset"]
+    assert task["total"] == 1
+    assert all("start_at" not in r.url.params for r in requests)

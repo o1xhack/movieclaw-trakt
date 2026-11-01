@@ -17,8 +17,8 @@ test('export preview and lazy record details disclose minute precision before co
     document:{getElementById:get, createElement:element, addEventListener() {}, hidden:false},
     window:{addEventListener() {}},
     fetch:async (url, options) => {
-      requests.push({url:String(url), method:options.method});
-      const data = String(url).includes('/fixture?') ? {task, pages:1, items:[{
+      requests.push({url:String(url), method:options.method, body:options.body});
+      const data = options.method === 'POST' ? task : String(url).includes('/fixture?') ? {task, pages:1, items:[{
         media:{kind:'movie',title:'Fixture'}, watched_at:'2020-01-01T12:34:59.999Z',
         trakt_watched_at:'2020-01-01T12:34:00Z', minute_collision:true, state:'pending',
       }]} : {tasks:[],total:0};
@@ -38,4 +38,15 @@ test('export preview and lazy record details disclose minute precision before co
   const complete = vm.runInContext("description({...task, state:'complete', done:1})", context);
   assert.match(complete, /按 Trakt 分钟精度对齐/);
   assert.doesNotMatch(complete, /全部同步/);
+  await get('export').onclick();
+  assert.deepEqual(JSON.parse(requests.find(r => r.method === 'POST').body),
+    {direction:'export', mode:'incremental'});
+  requests.length = 0;
+  await get('import-full').onclick();
+  assert.deepEqual(JSON.parse(requests.find(r => r.method === 'POST').body),
+    {direction:'import', mode:'full'});
+  vm.runInContext("task = {...task, state:'scanning'}; render()", context);
+  for (const id of ['export', 'import', 'export-full', 'import-full']) {
+    assert.equal(get(id).disabled, true);
+  }
 });
