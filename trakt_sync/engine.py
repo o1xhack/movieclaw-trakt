@@ -596,9 +596,12 @@ class Engine(ActivityLog, Recovery):
                 "pending",
                 "ledger",
                 "activity",
+                "import_activity",
+                "import_activity_backfill",
                 "linked",
                 "delivery",
                 "storage_error",
+                "automatic_import_binding",
             ):
                 await self.store.delete(key, scope=self.scope(member))
             self.rotated.pop(member, None)

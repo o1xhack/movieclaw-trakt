@@ -8,7 +8,7 @@ Minute-merged exports persist their precise source watch-ordering marker before 
 
 ## Version 0.3
 
-Version 0.3.0 targets official v0.44.0 and requires stopped/completed event contracts 1.1. Four host operations cover metadata reads, watch catalog and dated imports, with no filesystem permission. Manual actions and confirmed foreground history use separate durable plans; the playback-ledger limits below do not bound those plans. Terminal item errors do not block later actions. See the [workflow](sync-workflow.zh-CN.md).
+The compatibility baseline is official v0.44.0. Host operations cover metadata reads, the watch catalog, dated imports, and `members.show` for automatic-import member identity checks. The server-side worker subscribes to `library.files.added` 2.0 and periodically rechecks inventory. Manual actions and confirmed foreground history use separate durable plans. The plugin has no filesystem permission. See the [workflow](sync-workflow.zh-CN.md).
 
 Install and update through **Settings → Plugins → Plugin Market**, as described in the [README](../README.en.md). Users are not asked to switch server branches. The manifest requests playback events, network and plugin storage, without media deletion or media-file access.
 

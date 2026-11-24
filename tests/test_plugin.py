@@ -133,8 +133,10 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
         assert fiber.state.value == "active"
         app.include_router(host_router, prefix="/api/v1")
         assert len(subscribers) == 6
-        assert len(h.events.owned_by("trakt-sync")) == 1
-        assert h.events.owned_by("trakt-sync")[0].event is PLAYBACK_PROGRESS
+        assert {listener.event.name for listener in h.events.owned_by("trakt-sync")} == {
+            PLAYBACK_PROGRESS.name,
+            "library.files.added",
+        }
         prefix = "/api/v1/plugins/trakt-sync"
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://fixture"
@@ -172,7 +174,10 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
             assert (await web.get(prefix + "/status?member_id=-1")).status_code == 422
             profile = {"manual_watched": True, "manual_unwatched": False, "favorites": True}
             assert (await web.put(prefix + "/profile", json=profile)).status_code == 200
-            assert (await web.get(prefix + "/profile")).json()["preferences"] == profile
+            assert (await web.get(prefix + "/profile")).json()["preferences"] == {
+                **profile,
+                "automatic_import": False,
+            }
             assert (await web.get(prefix + "/profile?member_id=2")).json()["preferences"] != profile
             # 从真实 SDK 事件入口验证新增订阅，而非只调用 Actions 本身。
             from movieclaw_sdk.events import ItemFavorite, PlaybackMarked

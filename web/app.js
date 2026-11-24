@@ -1,9 +1,9 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const states = {queued:"待发送", retrying:"自动重试中", blocked:"需要重新连接", failed:"发送失败", sent:"已发送", skipped:"未发送"};
-const events = {started:"开始播放", progress:"更新播放进度", stopped:"停止播放", completed:"观看完成", marked_played:"手动标记已看", marked_unplayed:"手动取消已看", favorited:"收藏加入 Watchlist"};
+const events = {started:"开始播放", progress:"更新播放进度", stopped:"停止播放", completed:"观看完成", marked_played:"手动标记已看", marked_unplayed:"手动取消已看", favorited:"收藏加入 Watchlist", automatic_import:"后台导入已看", history_import:"手动导入历史", history_export:"手动导出历史"};
 let generation = 0, revision = 0, selected = 0, filter = "all", records = [], busy = false;
-let accountSnapshot = "", recordSnapshot = "", noticeTimer, activityType = "important";
+let accountSnapshot = "", recordSnapshot = "", noticeTimer, activityType = "important", activityDirection = "all";
 function el(tag, cls, text) {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
@@ -16,10 +16,10 @@ function readMember() {
   if (!Number.isSafeInteger(n) || n < 0 || $("member").value.trim() === "") throw new Error("请输入有效的成员 ID");
   return n;
 }
-function time(value) {
+function time(value, includeYear = false) {
   if (!value) return "暂无发送";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString(undefined, {month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"});
+  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString(undefined, {...(includeYear ? {year:"numeric"} : {}), month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"});
 }
 let savingProfile = false;
 async function api(path, method = "GET", id = selected, body) {
@@ -72,25 +72,29 @@ function renderRecords() {
   const container = $("records");
   const open = new Set([...container.querySelectorAll("details[open]")].map(node => node.dataset.id));
   container.replaceChildren();
-  const visible = records.filter(row => ActivityLogic.matches(row, filter, activityType));
+  const visible = records.filter(row => ActivityLogic.matches(row, filter, activityType, activityDirection));
   if (!visible.length) {
     const empty = el("div", "empty");
-    empty.append(el("strong", "", "当前筛选下没有记录"), el("p", "", activityType === "important" ? "默认显示观看标记与收藏；可切换活动类型查看开始播放、进度和停止记录。" : "可切换活动类型或发送状态；新的记录会自动更新。"));
+    empty.append(el("strong", "", "当前筛选下没有记录"), el("p", "", activityType === "important" ? "默认显示观看标记与收藏；可切换活动类型查看开始播放、进度和停止记录。" : "可切换活动类型、同步方向或状态；新的记录会自动更新。"));
     container.append(empty); return;
   }
   for (const row of visible) {
     const details = el("details", "delivery"); details.dataset.id = row.id; details.open = open.has(row.id);
     const summary = el("summary");
     summary.append(el("span", `delivery-icon ${row.state}`, row.state === "sent" ? "✓" : ["failed","blocked"].includes(row.state) ? "!" : row.state === "skipped" ? "−" : "↗"));
+    const inbound = row.direction === "inbound";
+    const direction = inbound ? "Trakt → MovieClaw" : "MovieClaw → Trakt";
+    const event = events[row.event] || "播放同步";
+    const state = inbound ? ({sent:"已导入", skipped:"未导入"}[row.state] || states[row.state]) : states[row.state];
     const main = el("div", "delivery-main");
     const episode = row.season != null && row.episode != null ? ` · S${String(row.season).padStart(2,"0")}E${String(row.episode).padStart(2,"0")}` : "";
-    main.append(el("div", "delivery-title", (row.title || "未命名影片") + episode), el("div", `delivery-meta${["failed","blocked"].includes(row.state) ? " has-error" : ""}`, row.reason || events[row.event] || "播放同步"));
+    main.append(el("div", "delivery-title", (row.title || "未命名影片") + episode), el("div", `delivery-meta${["failed","blocked"].includes(row.state) ? " has-error" : ""}`, `${direction} · ${row.reason || event}`));
     const end = el("div", "delivery-end");
-    end.append(el("span", `badge ${row.state}`, states[row.state] || row.state), el("p", "delivery-time", time(row.completed_at || row.occurred_at)));
+    end.append(el("span", `badge ${row.state}`, state || row.state), el("p", "delivery-time", time(row.completed_at || row.occurred_at)));
     summary.append(main,end,el("span", "chevron", "›")); details.append(summary);
     const body = el("div", "delivery-detail");
-    body.append(el("p", "", `${events[row.event] || "播放同步"} · 观看时间 ${time(row.occurred_at)}`));
-    if (row.completed_at) body.append(el("p", "", `处理时间 ${time(row.completed_at)}`));
+    body.append(el("p", "", `${direction} · ${event} · 观看时间 ${time(row.occurred_at, true)}`));
+    if (row.completed_at) body.append(el("p", "", `${inbound && row.state === "sent" ? "导入" : "处理"}时间 ${time(row.completed_at, true)}`));
     if (row.error_status != null) body.append(el("p", "", row.error_status ? `Trakt 返回 HTTP ${row.error_status}` : "未能连接到 Trakt"));
     if (row.retry_at && ["retrying","blocked","failed"].includes(row.state)) body.append(el("p", "", `下次自动尝试 ${time(row.retry_at)}`));
     if (row.can_retry) {
@@ -140,14 +144,28 @@ async function refresh() {
   $("summary").classList.toggle("attention", !!failed || attention);
   $("summary").classList.toggle("idle", !connected && !attention);
   $("account-count").textContent = `${connected} 个已连接`;
-  $("activity-owner").textContent = `${current.username || memberLabel(id)}${current.username ? ` · ${memberLabel(id)}` : ""}的发送情况`;
+  $("activity-owner").textContent = `${current.username || memberLabel(id)}${current.username ? ` · ${memberLabel(id)}` : ""}的同步情况`;
   $("retry").hidden = !current.failed;
   $("acknowledge-dropped").hidden = !current.unacknowledged_dropped;
   $("connect").disabled = busy || !current.configured || current.has_account;
   $("disconnect").disabled = !current.has_account || busy;
   $("profile-owner").textContent = `${memberLabel(id)}的个人设置`;
   $("history-link").href = `history.html?member_id=${id}`;
-  if (!savingProfile) for (const input of document.querySelectorAll("[data-preference]")) input.checked = profile.preferences[input.dataset.preference];
+  if (!savingProfile) for (const input of document.querySelectorAll("[data-preference]")) {
+    input.checked = !!profile.preferences[input.dataset.preference];
+    input.disabled = input.dataset.preference === "automatic_import" && !input.checked && !current.connected;
+  }
+  const inbound = profile.background_import || {};
+  const enabled = profile.preferences.automatic_import;
+  $("background-import-controls").hidden = !enabled;
+  $("background-import-now").disabled = !current.enabled || !current.connected || inbound.running;
+  const last = inbound.last_checked ? `上次检查 ${time(inbound.last_checked)} · 累计导入 ${inbound.imported} 条` : "正在等待首次检查";
+  const protectedCount = inbound.protected ? ` · 上次保留 ${inbound.protected} 条本地状态或身份冲突` : "";
+  $("background-import-state").textContent = !current.enabled ? "插件已停用"
+    : !current.connected ? "Trakt 连接不可用，请检查账号"
+    : inbound.running ? "服务器正在检查观看历史…"
+    : inbound.error ? `${inbound.error}${inbound.retry_at ? ` · ${time(inbound.retry_at * 1000)} 后重试` : ""}`
+    : last + protectedCount;
   records = detail.records;
   const nextAccounts = JSON.stringify([id,busy,accounts]), nextRecords = JSON.stringify([id,records]);
   if (nextAccounts !== accountSnapshot) { renderAccounts(accounts); accountSnapshot = nextAccounts; }
@@ -219,18 +237,29 @@ $("disconnect").onclick = action(async () => {
 });
 $("activity-type").onchange = () => { activityType = $("activity-type").value; renderRecords(); };
 const tabs = [...document.querySelectorAll("[data-filter]")];
+$("activity-direction").onchange = () => { activityDirection = $("activity-direction").value; renderRecords(); };
 for (const tab of tabs) {
   tab.onclick = () => { filter = tab.dataset.filter; for (const other of tabs) other.setAttribute("aria-selected", String(other === tab)); renderRecords(); };
   tab.onkeydown = event => { if (["ArrowLeft","ArrowRight"].includes(event.key)) { event.preventDefault(); const next = tabs[(tabs.indexOf(tab)+(event.key === "ArrowRight" ? 1 : tabs.length-1))%tabs.length]; next.click(); next.focus(); } };
 }
+$("background-import-now").onclick = action(async () => {
+  await api("background-import", "POST");
+  await refresh();
+  notice("已请求服务器检查 Trakt 和媒体库。");
+});
 for (const input of document.querySelectorAll("[data-preference]")) input.onchange = action(async () => {
+  if (input.dataset.preference === "automatic_import" && input.checked &&
+      !confirm("允许服务器为此成员自动导入 Trakt 观看历史？首次检查会回填已有记录，后续会自动补标。")) {
+    input.checked = false;
+    return;
+  }
   const id = selected;
   const inputs = [...document.querySelectorAll("[data-preference]")];
   const payload = Object.fromEntries(inputs.map(box => [box.dataset.preference, box.checked]));
   savingProfile = true; inputs.forEach(box => { box.disabled = true; });
   try { await api("profile", "PUT", id, payload); $("profile-state").textContent = "已保存到当前成员的资料"; }
   catch (error) { input.checked = !input.checked; throw error; }
-  finally { savingProfile = false; inputs.forEach(box => { box.disabled = false; }); }
+  finally { savingProfile = false; inputs.forEach(box => { box.disabled = false; }); await refresh(); }
 });
 action(async () => {
   const viewer = await api("viewer"); const requested = Number(new URLSearchParams(location.search).get("member_id")); selected = viewer.is_admin && Number.isSafeInteger(requested) && requested >= 0 ? requested : viewer.member_id; $("member").value = selected;

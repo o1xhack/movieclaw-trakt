@@ -15,3 +15,13 @@ test('type and send-state filters compose; playback noise is hidden by default',
   assert.equal(rows.filter(r=>A.matches(r,'all','all')).length,7);
   assert.equal(rows.filter(r=>A.matches(r,'sent','favorite')).length,0);
 });
+
+
+test("imports and older outbound rows can be filtered by direction", () => {
+  const incoming = {event:"automatic_import", category:"watched", direction:"inbound", state:"sent"};
+  const outgoing = {event:"completed", state:"sent"};
+  assert.ok(A.matches(incoming, "sent", "important", "inbound"));
+  assert.ok(!A.matches(incoming, "all", "important", "outbound"));
+  assert.ok(A.matches(outgoing, "all", "important", "outbound"));
+  assert.ok(!A.matches(outgoing, "all", "important", "inbound"));
+});

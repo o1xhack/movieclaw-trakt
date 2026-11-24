@@ -23,3 +23,9 @@ Retries use two read-only host metadata operations (`library.list`, `library.ite
 管理员在独立历史页手动扫描，经完整预览和 Confirm 后，网页逐批读取或写入。`playback.sync.catalog` 读取所选成员可见的库内影片、单集及观看事实；`playback.sync.import` 将匹配的 Trakt 原日期和重看事实导入所选成员。插件保存扫描计划、标题、日期、批次状态及去重回执供 History 查询；这些批次不属于最近 80 条活动的容量限制，断开账号后保留用于核对，但旧任务无法写入新绑定。另保存按成员、条目编号哈希与绑定代次隔离的取消已看及最近成功观看时间标记，防止旧事件或旧重试覆盖较新的操作；不包含文件路径或凭据。无文件系统权限，不读写视频。
 
 The three member-scoped preferences default off. Enabled manual unwatched actions remove all Trakt watches for the selected movie/episode; new favorites add to Watchlist. Administrator-triggered history transfers read local holdings/watch facts and Trakt history, preserve original dates/rewatches, and import only matched local units after preview and Confirm. Plans, titles, dates, batch outcomes and deduplication receipts persist separately from the bounded activity feed; disconnect retains this audit history while preventing old tasks from writing through a new binding. No filesystem access is granted.
+
+## 服务器后台导入 / Server-side automatic import
+
+后台导入默认关闭，由管理员按成员和当前 Trakt 连接开启。插件读取 Trakt 活动、观看摘要和历史，在检查晚入库内容时可向 Trakt 查询电影或剧集的外部编号。对非管理员成员，`members.show` 用于核实账号创建身份，只保留身份摘要。检查点保存加密的条目索引和摘要，避免每次重查全量历史。断开 Trakt 连接会清除后台导入授权及索引，已写入 MovieClaw 的观看事实保留。插件也保留本地取消已看的时间和条目标识摘要，用于尊重后来的本地操作。
+
+Automatic import is off by default and scoped to the opted-in member and connection. It reads Trakt activity, compact watch summaries and history. For late arrivals it may query Trakt using a movie or show identifier. The plugin keeps encrypted checkpoint indexes with hashed summaries, an account identity fingerprint, and a per-item local unwatch timestamp. Disconnect clears the automatic import opt-in and indexes. MovieClaw retains viewing facts already imported into its catalog.

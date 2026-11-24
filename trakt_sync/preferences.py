@@ -8,7 +8,10 @@ class Preferences(BaseModel):
     manual_watched: bool = False
     manual_unwatched: bool = False
     favorites: bool = False
+    automatic_import: bool = False
 
 
 async def preferences(engine, member):
-    return Preferences.model_validate(await engine.get(member, "profile", {}))
+    profile = await engine.get(member, "profile", {})
+    binding = await engine.get(member, "automatic_import_binding", {})
+    return Preferences.model_validate({**profile, "automatic_import": bool(binding)})
