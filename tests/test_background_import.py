@@ -6,6 +6,7 @@ import pytest
 
 from trakt_sync.background import BackgroundImport
 from trakt_sync.policy import identity, iso_time, timestamp
+from trakt_sync.preferences import preferences
 
 
 def episode(record, number, when, *, series=200, trakt=100):
@@ -399,3 +400,46 @@ async def test_outbound_native_id_skips_cross_minute_echo_but_keeps_rewatch(harn
     rows.append({**episode(124, 1, rewatch_at), "action": "scrobble"})
     await worker.process(0)
     assert [r["watched_at"] for r in host.records.values()] == [rewatch_at]
+
+
+async def test_lost_scrobble_does_not_exclude_any_ambiguous_history_ids(harness):
+    rows = [
+        {**episode(321, 1, "2026-01-01T11:00:00Z"), "action": "scrobble"},
+        {**episode(322, 1, "2026-01-01T11:01:00Z"), "action": "scrobble"},
+    ]
+
+    def trakt(request):
+        assert request.url.path == "/sync/history/episodes"
+        page = int(request.url.params["page"])
+        return httpx.Response(200, json=[rows[page - 1]], headers={"X-Pagination-Page-Count": "2"})
+
+    engine, _, _, requests = await harness(trakt)
+    account = await engine.get(0, "account")
+    unit = local_episode(1)
+    item = identity({"media": unit["media"], "unit": unit})
+    found, received_id = await engine.find_delivered_history(
+        0,
+        account,
+        {
+            "item": item,
+            "occurred_at": "2026-01-01T10:59:59Z",
+            "scrobble_window": {
+                "item": item,
+                "start": "2026-01-01T11:00:59Z",
+                "end": "2026-01-01T11:01:01Z",
+            },
+        },
+    )
+    assert found and received_id is None
+    assert len(requests) == 2
+
+
+async def test_stale_binding_requires_new_consent_after_reconnection(harness):
+    engine, _, _, _ = await harness()
+    await opt_in(engine, BackgroundImport(engine, Host([])))
+    assert (await preferences(engine, 0)).automatic_import
+    account = await engine.get(0, "account")
+    await engine.set(0, "account", {**account, "generation": "replacement"})
+    assert not (await preferences(engine, 0)).automatic_import
+    await opt_in(engine, BackgroundImport(engine, Host([])))
+    assert (await preferences(engine, 0)).automatic_import

@@ -14,4 +14,9 @@ class Preferences(BaseModel):
 async def preferences(engine, member):
     profile = await engine.get(member, "profile", {})
     binding = await engine.get(member, "automatic_import_binding", {})
-    return Preferences.model_validate({**profile, "automatic_import": bool(binding)})
+    try:
+        account = await engine.get(member, "account", {}) if binding else {}
+    except ValueError:
+        account = {}
+    current = bool(account.get("generation")) and binding.get("generation") == account["generation"]
+    return Preferences.model_validate({**profile, "automatic_import": current})

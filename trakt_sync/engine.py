@@ -839,15 +839,22 @@ class Engine(ActivityLog, Recovery):
         return updated
 
     async def history_exists(self, member, account, job):
+        found, _ = await self.find_delivered_history(member, account, job)
+        return found
+
+    async def find_delivered_history(self, member, account, job):
         when = trakt_minute(job.get("history_at", job["occurred_at"]))
         end = when
         window = job.get("scrobble_window")
-        if window and window["item"] == job["item"]:
+        native_window = window and window["item"] == job["item"]
+        if native_window:
             # Native scrobbles receive a server time, unlike explicit history writes.
             when, end = trakt_minute(window["start"]), trakt_minute(window["end"])
         kind = "movies" if "movie" in job["item"] else "episodes"
         page = 1
         previous = None
+        found = False
+        confirmed_id = None
         while True:
             rows = await self.authorized(
                 member,
@@ -863,9 +870,18 @@ class Engine(ActivityLog, Recovery):
             )
             for row in rows:
                 if matches(job["item"], row) and when <= trakt_minute(row["watched_at"]) <= end:
-                    return row
+                    if not native_window:
+                        return True, None
+                    remote_id = row.get("id")
+                    if found and (confirmed_id is None or remote_id != confirmed_id):
+                        # A history match is enough to avoid a second outgoing write. It
+                        # cannot identify which of several matches was this scrobble.
+                        return True, None
+                    found = True
+                    if row.get("action") == "scrobble" and type(remote_id) is int and remote_id > 0:
+                        confirmed_id = remote_id
             if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
-                return False
+                return found, confirmed_id
             signature = json.dumps(rows, sort_keys=True)
             if signature == previous:
                 raise TraktError(502)
@@ -994,15 +1010,17 @@ class Engine(ActivityLog, Recovery):
                         if not any(j["id"] == job["id"] for j in ledger["queue"]):
                             return
                     if finished and (job["path"] == "/sync/history" or uncertain or late):
-                        existing = await self.history_exists(member, account, job)
+                        existing, recovered_id = await self.find_delivered_history(
+                            member, account, job
+                        )
                         if existing:
                             result = {
                                 "action": "minute_merged"
                                 if job.get("export_collision")
                                 else "already_synced"
                             }
-                            if job.get("scrobble_window") and existing.get("action") == "scrobble":
-                                result["scrobble_history_id"] = existing.get("id")
+                            if recovered_id is not None:
+                                result["scrobble_history_id"] = recovered_id
                         else:
                             if (
                                 job.get("clear_watching")
