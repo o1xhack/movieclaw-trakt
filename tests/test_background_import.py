@@ -2,9 +2,10 @@ import asyncio
 from collections import Counter
 
 import httpx
+import pytest
 
 from trakt_sync.background import BackgroundImport
-from trakt_sync.policy import iso_time
+from trakt_sync.policy import identity, iso_time, timestamp
 
 
 def episode(record, number, when, *, series=200, trakt=100):
@@ -290,3 +291,111 @@ async def test_retry_after_and_disable_before_write(harness):
         await task
     assert not host.records
     assert host.calls["playback.sync.import"] == 0
+
+
+async def test_explicit_unwatch_before_connection_outweighs_later_favorite(harness):
+    engine, store, _, _ = await harness()
+    account = await engine.get(0, "account")
+    await store.delete("account", scope="member:0")
+    await store.delete("linked", scope="member:0")
+    unit = local_episode(
+        1,
+        "2025-01-03T00:00:00Z",
+        last_played_at=None,
+        position_ms=0,
+    )
+    worker = BackgroundImport(engine, Host([unit]))
+    await worker.remember_unwatch(
+        {"member_id": 0, "media": unit["media"], "units": [{"season": 1, "episode": 1}]},
+        "2025-01-01T00:00:00Z",
+    )
+    await engine.set(0, "account", account, secret=True)
+    await opt_in(engine, worker)
+    item = identity({"media": unit["media"], "unit": unit})
+    assert await worker.protected(0, "admin", unit, item, "2024-12-31T00:00:00Z")
+    unit["watches"] = [{"basis": "import", "watched_at": "2024-12-31T00:00:00Z"}]
+    assert not await worker.protected(0, "admin", unit, item, "2025-01-02T00:00:00Z")
+
+
+async def test_catalog_removal_reconciles_surviving_previously_ambiguous_episode(harness):
+    row = episode(1, 1, "2020-01-01T11:00:00Z")
+
+    def trakt(request):
+        if request.url.path == "/sync/last_activities":
+            return httpx.Response(200, json={"episodes": {"watched_at": "2020-01-01T11:00:00Z"}})
+        if request.url.path == "/sync/history/episodes":
+            return httpx.Response(200, json=[row], headers={"X-Pagination-Page-Count": "1"})
+        return None
+
+    engine, _, _, requests = await harness(trakt)
+    first, duplicate = local_episode(1), local_episode(1)
+    duplicate["media"]["id"] = 71
+    host = Host([first])
+    host.units[2] = duplicate
+    worker = BackgroundImport(engine, host)
+    await opt_in(engine, worker)
+    await worker.process(0)
+    assert not host.records
+
+    del host.units[2]
+    worker.inventory_changed()
+    requests.clear()
+    await worker.process(0)
+    assert [r["episode"] for r in host.records.values()] == [1]
+    assert any(r.url.path == "/sync/history/episodes" for r in requests)
+
+
+@pytest.mark.parametrize("lost_response", [False, True])
+async def test_outbound_native_id_skips_cross_minute_echo_but_keeps_rewatch(harness, lost_response):
+    native_at = "2026-01-01T11:00:59Z"
+    echoed_at = "2026-01-01T11:01:00Z"
+    rewatch_at = "2026-01-02T11:01:00Z"
+    rows = []
+
+    def trakt(request):
+        if request.url.path == "/scrobble/stop":
+            rows.append({**episode(123, 1, echoed_at), "action": "scrobble"})
+            if lost_response:
+                raise httpx.ReadError("fixture", request=request)
+            return httpx.Response(201, json={"action": "scrobble", "id": 123})
+        if request.url.path == "/sync/last_activities":
+            return httpx.Response(200, json={"episodes": {"watched_at": rewatch_at}})
+        if request.url.path == "/sync/history/episodes":
+            return httpx.Response(200, json=rows, headers={"X-Pagination-Page-Count": "1"})
+        return None
+
+    engine, _, clock, _ = await harness(trakt)
+    unit = local_episode(1)
+    unit.update(played=True, watches=[{"basis": "playback", "watched_at": native_at}])
+    clock[0] = timestamp("2026-01-01T11:01:01Z")
+    await engine.accept(
+        "completed",
+        {
+            "member_id": 0,
+            "media": unit["media"],
+            "unit": unit,
+            "position_ms": 100,
+            "duration_ms": 100,
+            "watch_source_ids": ["source-1"],
+        },
+        "native",
+        native_at,
+    )
+    await engine.drain(0)
+    host = Host([unit])
+    worker = BackgroundImport(engine, host)
+    await opt_in(engine, worker)
+    if lost_response:
+        await worker.process(0)
+        assert not host.records
+        assert "stamp" not in await engine.get(0, "background_import")
+        clock[0] += 70
+        await engine.drain(0)
+    account = await engine.get(0, "account")
+    assert await engine.outbound_scrobble(
+        0, account, 123, identity({"media": unit["media"], "unit": unit})
+    )
+    clock[0] = timestamp("2026-01-03T00:00:00Z")
+    rows.append({**episode(124, 1, rewatch_at), "action": "scrobble"})
+    await worker.process(0)
+    assert [r["watched_at"] for r in host.records.values()] == [rewatch_at]

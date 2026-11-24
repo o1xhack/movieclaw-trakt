@@ -144,9 +144,12 @@ class HostIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         fiber = await harness.mount(apply, config=config)
                         self.assertEqual(fiber.state.value, "active")
                         self.assertEqual(len(subscribers), 6)
-                        self.assertIs(
-                            harness.events.owned_by("trakt-sync")[0].event,
-                            PLAYBACK_PROGRESS,
+                        self.assertEqual(
+                            {
+                                listener.event.name
+                                for listener in harness.events.owned_by("trakt-sync")
+                            },
+                            {PLAYBACK_PROGRESS.name, "library.files.added"},
                         )
                         prefix = "/api/v1/plugins/trakt-sync"
                         async with httpx.AsyncClient(

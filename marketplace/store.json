@@ -3,7 +3,7 @@
   "author_url": "https://github.com/o1xhack",
   "license": "MIT",
   "origin": "official",
-  "summary": "播放、已看与收藏同步到各成员的 Trakt，支持确认后的双向历史同步",
+  "summary": "将播放与收藏同步到各成员的 Trakt，可自动导入 Trakt 已看并查看双向活动",
   "homepage": "https://github.com/o1xhack/movieclaw-trakt",
   "category": "tools"
 }

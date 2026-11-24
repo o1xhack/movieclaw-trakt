@@ -8,7 +8,7 @@ from movieclaw_sdk.ops import OpsError
 
 from .activity import watch_activity
 from .client import TraktError
-from .policy import identity, iso_time, timestamp, trakt_minute
+from .policy import identity, iso_time, matches, timestamp, trakt_minute
 from .transfers import Transfers, digest, unit_key
 
 KINDS = ("movies", "episodes")
@@ -135,7 +135,7 @@ class BackgroundImport:
     async def remember_unwatch(self, event, when):
         member = event["member_id"]
         async with self.e.locks[member]:
-            if not await self.e.get(member, "linked", False):
+            if not self.e.enabled:
                 return
             owner = await self.member_identity(member)
             media = event["media"]
@@ -151,6 +151,13 @@ class BackgroundImport:
     async def protected(self, member, owner, unit, item, when):
         if unit["played"]:
             return False
+        marks = []
+        for key in self.e.unwatch_keys(item, prefix="import_unwatch"):
+            mark = await self.e.get(member, key, {})
+            if mark.get("owner") == owner:
+                marks.append(timestamp(mark["at"]))
+        if marks:
+            return timestamp(when) <= max(marks)
         if (
             unit.get("watches")
             and unit["updated_at"]
@@ -161,10 +168,6 @@ class BackgroundImport:
             # The catalog retains historical facts after a local reset, including older resets
             # from before this plugin recorded the event.
             return True
-        for key in self.e.unwatch_keys(item, prefix="import_unwatch"):
-            mark = await self.e.get(member, key, {})
-            if mark.get("owner") == owner and timestamp(when) <= timestamp(mark["at"]):
-                return True
         return False
 
     async def snapshot(self, member, name, generation):
@@ -336,14 +339,33 @@ class BackgroundImport:
         conflict = False
         for start in range(0, len(candidates), 100):
             async with self.e.locks[member]:
-                await self.account(member, generation)
+                account = await self.account(member, generation)
                 owner = await self.verify_member(member)
+                pending_scrobbles = [
+                    job["scrobble_window"]
+                    for job in (await self.e.ledger(member))["queue"]
+                    if job["generation"] == generation and job.get("scrobble_window")
+                ]
                 batch, activity = [], []
-                for unit, source_id, when in candidates[start : start + 100]:
+                for unit, source_id, when, remote_id, action in candidates[start : start + 100]:
                     key = unit_key(unit)
                     if key in versions and versions[key] is False:
                         continue
                     item = identity({"media": unit["media"], "unit": unit})
+                    if (unit["played"] or unit["watches"]) and await self.e.outbound_scrobble(
+                        member, account, remote_id, item
+                    ):
+                        continue
+                    if action == "scrobble" and any(
+                        matches(item, pending["item"])
+                        and trakt_minute(pending["start"])
+                        <= trakt_minute(when)
+                        <= trakt_minute(pending["end"])
+                        for pending in pending_scrobbles
+                    ):
+                        # Wait for the outbound receipt before advancing the import checkpoint.
+                        conflict = True
+                        continue
                     if await self.protected(member, owner, unit, item, when):
                         held += 1
                         activity.append(
@@ -454,6 +476,9 @@ class BackgroundImport:
             if (
                 full
                 or before is None
+                # A removed or reidentified item can leave a formerly ambiguous
+                # match with exactly one surviving target.
+                or any(inventory.get(key) != value for key, value in before.items())
                 or (kind in changed and (remote is None or old_remote is None))
             ):
                 paths = {f"/sync/history/{kind}": None}
@@ -494,7 +519,7 @@ class BackgroundImport:
                 if trakt_minute(when) in native[key]:
                     continue
                 source = digest([namespace, remote_id])
-                fact = (unit, source, when)
+                fact = (unit, source, when, remote_id, row.get("action"))
                 if source in candidates and candidates[source] != fact:
                     raise RetryScan("Trakt 返回了相互冲突的观看记录")
                 candidates[source] = fact

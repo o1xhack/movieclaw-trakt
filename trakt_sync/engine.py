@@ -131,6 +131,23 @@ class Engine(ActivityLog, Recovery):
         values = [values] if isinstance(values, str) else values or []
         return tuple(dict.fromkeys(v for v in values if isinstance(v, str) and 0 < len(v) <= 200))
 
+    @staticmethod
+    def scrobble_key(account_identity, remote_id):
+        return (
+            "outbound_scrobble_"
+            + hashlib.sha256(json.dumps([account_identity, remote_id]).encode()).hexdigest()
+        )
+
+    async def outbound_scrobble(self, member, account, remote_id, item):
+        # A scrobble history ID represents one particular viewing, independent of minute
+        # boundaries or other rewatches of the same movie or episode.
+        identities = {account["generation"], account.get("user_uuid")} - {None}
+        for account_identity in identities:
+            delivered = await self.get(member, self.scrobble_key(account_identity, remote_id))
+            if delivered and matches(item, delivered):
+                return True
+        return False
+
     async def source_delivery(self, member, generation, item, source_ids, *, details=False):
         selected = None
         for source_id in self.source_ids(source_ids):
@@ -846,7 +863,7 @@ class Engine(ActivityLog, Recovery):
             )
             for row in rows:
                 if matches(job["item"], row) and when <= trakt_minute(row["watched_at"]) <= end:
-                    return True
+                    return row
             if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
                 return False
             signature = json.dumps(rows, sort_keys=True)
@@ -977,12 +994,15 @@ class Engine(ActivityLog, Recovery):
                         if not any(j["id"] == job["id"] for j in ledger["queue"]):
                             return
                     if finished and (job["path"] == "/sync/history" or uncertain or late):
-                        if await self.history_exists(member, account, job):
+                        existing = await self.history_exists(member, account, job)
+                        if existing:
                             result = {
                                 "action": "minute_merged"
                                 if job.get("export_collision")
                                 else "already_synced"
                             }
+                            if job.get("scrobble_window") and existing.get("action") == "scrobble":
+                                result["scrobble_history_id"] = existing.get("id")
                         else:
                             if (
                                 job.get("clear_watching")
@@ -1084,6 +1104,14 @@ class Engine(ActivityLog, Recovery):
                 "local_deleted",
                 "manual_unwatched",
             }:
+                remote_id = (
+                    result.get("id")
+                    if job["path"] == "/scrobble/stop" and result.get("action") == "scrobble"
+                    else result.get("scrobble_history_id")
+                )
+                if type(remote_id) is int and remote_id > 0:
+                    owner = account.get("user_uuid") or account["generation"]
+                    await self.set(member, self.scrobble_key(owner, remote_id), job["item"])
                 watched_at = job["occurred_at"]
                 if delivered and delivered.get("export"):
                     watched_at = max(watched_at, delivered["export"]["watched_at"], key=timestamp)

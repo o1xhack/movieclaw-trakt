@@ -21,7 +21,14 @@ function time(value, includeYear = false) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString(undefined, {...(includeYear ? {year:"numeric"} : {}), month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit"});
 }
-let savingProfile = false;
+let savingProfile = false, profileMember = null;
+const preferenceInputs = () => [...document.querySelectorAll("[data-preference]")];
+function invalidateProfile() {
+  profileMember = null;
+  preferenceInputs().forEach(input => { input.disabled = true; });
+  $("background-import-now").disabled = true;
+  $("profile-state").textContent = "";
+}
 async function api(path, method = "GET", id = selected, body) {
   const url = new URL(`/api/v1/plugins/trakt-sync/${path}`, location.origin);
   url.searchParams.set("member_id", id);
@@ -40,7 +47,7 @@ function action(fn) {
 }
 function cancelAuth() { generation++; busy = false; if ($("authorization").open) $("authorization").close(); }
 async function selectMember(id) {
-  if (id !== selected) { cancelAuth(); selected = id; }
+  if (id !== selected) { cancelAuth(); invalidateProfile(); selected = id; }
   $("member").value = String(id);
   await refresh();
 }
@@ -151,14 +158,17 @@ async function refresh() {
   $("disconnect").disabled = !current.has_account || busy;
   $("profile-owner").textContent = `${memberLabel(id)}的个人设置`;
   $("history-link").href = `history.html?member_id=${id}`;
-  if (!savingProfile) for (const input of document.querySelectorAll("[data-preference]")) {
-    input.checked = !!profile.preferences[input.dataset.preference];
-    input.disabled = input.dataset.preference === "automatic_import" && !input.checked && !current.connected;
+  if (!savingProfile) {
+    profileMember = id;
+    for (const input of preferenceInputs()) {
+      input.checked = !!profile.preferences[input.dataset.preference];
+      input.disabled = input.dataset.preference === "automatic_import" && !input.checked && !current.connected;
+    }
   }
   const inbound = profile.background_import || {};
   const enabled = profile.preferences.automatic_import;
   $("background-import-controls").hidden = !enabled;
-  $("background-import-now").disabled = !current.enabled || !current.connected || inbound.running;
+  $("background-import-now").disabled = profileMember !== id || !current.enabled || !current.connected || inbound.running;
   const last = inbound.last_checked ? `上次检查 ${time(inbound.last_checked)} · 累计导入 ${inbound.imported} 条` : "正在等待首次检查";
   const protectedCount = inbound.protected ? ` · 上次保留 ${inbound.protected} 条本地状态或身份冲突` : "";
   $("background-import-state").textContent = !current.enabled ? "插件已停用"
@@ -243,25 +253,32 @@ for (const tab of tabs) {
   tab.onkeydown = event => { if (["ArrowLeft","ArrowRight"].includes(event.key)) { event.preventDefault(); const next = tabs[(tabs.indexOf(tab)+(event.key === "ArrowRight" ? 1 : tabs.length-1))%tabs.length]; next.click(); next.focus(); } };
 }
 $("background-import-now").onclick = action(async () => {
-  await api("background-import", "POST");
+  if (profileMember !== selected) return;
+  await api("background-import", "POST", selected);
   await refresh();
   notice("已请求服务器检查 Trakt 和媒体库。");
 });
-for (const input of document.querySelectorAll("[data-preference]")) input.onchange = action(async () => {
+for (const input of preferenceInputs()) input.onchange = action(async () => {
+  if (savingProfile || profileMember !== selected) return;
   if (input.dataset.preference === "automatic_import" && input.checked &&
       !confirm("允许服务器为此成员自动导入 Trakt 观看历史？首次检查会回填已有记录，后续会自动补标。")) {
     input.checked = false;
     return;
   }
   const id = selected;
-  const inputs = [...document.querySelectorAll("[data-preference]")];
-  const payload = Object.fromEntries(inputs.map(box => [box.dataset.preference, box.checked]));
-  savingProfile = true; inputs.forEach(box => { box.disabled = true; });
-  try { await api("profile", "PUT", id, payload); $("profile-state").textContent = "已保存到当前成员的资料"; }
-  catch (error) { input.checked = !input.checked; throw error; }
-  finally { savingProfile = false; inputs.forEach(box => { box.disabled = false; }); await refresh(); }
+  const payload = {[input.dataset.preference]: input.checked};
+  savingProfile = true;
+  invalidateProfile();
+  try {
+    await api("profile", "PUT", id, payload);
+    if (id === selected) $("profile-state").textContent = "已保存到当前成员的资料";
+  } finally {
+    savingProfile = false;
+    await refresh();
+  }
 });
 action(async () => {
+  invalidateProfile();
   const viewer = await api("viewer"); const requested = Number(new URLSearchParams(location.search).get("member_id")); selected = viewer.is_admin && Number.isSafeInteger(requested) && requested >= 0 ? requested : viewer.member_id; $("member").value = selected;
   if (!viewer.is_admin) {
     $("add-account").hidden = true; $("member").hidden = true; $("refresh").hidden = true;

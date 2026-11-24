@@ -272,8 +272,7 @@ async def apply(ctx: Context):
         member = member_id
         async with engine.locks[member]:
             old = await preferences(engine, member)
-            if "automatic_import" not in payload.model_fields_set:
-                payload.automatic_import = old.automatic_import
+            payload = old.model_copy(update=payload.model_dump(exclude_unset=True))
             binding = None
             if payload.automatic_import and not old.automatic_import:
                 if not engine.enabled or not (await engine.status(member))["connected"]:
