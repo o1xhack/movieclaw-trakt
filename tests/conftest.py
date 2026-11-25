@@ -65,7 +65,7 @@ def event():
 async def harness():
     clients = []
 
-    async def make(handler=None):
+    async def make(handler=None, *, report_watching=True):
         clock = [1800000000.0]
         requests = []
 
@@ -108,6 +108,8 @@ async def harness():
             },
             secret=True,
         )
+        if report_watching:
+            await engine.set(0, "report_watching", True)
         return engine, store, clock, requests
 
     yield make

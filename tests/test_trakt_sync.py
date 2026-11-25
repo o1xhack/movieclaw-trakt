@@ -87,6 +87,7 @@ class TrackingTests(unittest.IsolatedAsyncioTestCase):
             "client_id": "fixture-client",
         }
         await self.engine.set(0, "account", self.account, secret=True)
+        await self.engine.set(0, "report_watching", True)
         self.event = {
             "member_id": 0,
             "media": {"id": 7, "kind": "movie", "tmdb_id": 11},

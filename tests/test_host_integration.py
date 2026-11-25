@@ -109,6 +109,8 @@ class HostIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         )
                     if request.url.path == "/users/settings":
                         return httpx.Response(200, json={"user": {"username": "fixture-user"}})
+                    if request.method == "GET" and request.url.path.startswith("/sync/history/"):
+                        return httpx.Response(200, json=[])
                     return httpx.Response(201, json={"action": "scrobble"})
 
                 def subscribe(event, *, entry_id, listener_id, handler):
@@ -257,7 +259,11 @@ class HostIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                 422,
                             )
                             self.assertEqual(
-                                sum(r.url.path == "/scrobble/stop" for r in requests), 1
+                                sum(
+                                    r.method == "POST" and r.url.path == "/sync/history"
+                                    for r in requests
+                                ),
+                                1,
                             )
                             self.assertTrue(
                                 (await web.post(prefix + "/disconnect")).json()["disconnected"]

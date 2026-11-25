@@ -16,6 +16,12 @@ This plugin runs on your own MovieClaw server. It bundles only the public Client
 
 Retries use two read-only host metadata operations (`library.list`, `library.items.get`). Local media/file IDs are retained for matching; returned filesystem paths are not stored or accessed.
 
+## 正在观看 / Currently Watching
+
+在 Trakt 显示「正在观看」按成员设置，默认关闭。开启后插件向 Trakt 报告播放和停止，并可同步该次播放的续播进度。关闭后，插件仍向 Trakt 同步已完成的观看，MovieClaw 继续保存本地进度。关闭时，插件会清理可确认由自己开启的正在观看状态。
+
+Showing Currently Watching in Trakt is a per-member opt-in. When enabled, playback and stop events may send resume progress to Trakt. When disabled, completed viewings continue to sync and MovieClaw continues to save local playback progress. Turning the setting off can clear an active status that the plugin can verify it started.
+
 ## 0.3 历史与手动操作 / History and manual actions
 
 三个实时同步偏好在每个成员的插件 profile 中保存，默认关闭。开启后，手动标记向 Trakt 写入观看日期，手动取消已看删除对应电影／单集的全部 Trakt 观看记录，新增收藏加入 Watchlist。取消收藏不移除 Watchlist。

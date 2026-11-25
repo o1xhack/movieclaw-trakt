@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 
 test("switching members blocks stale preferences and unrelated updates omit import consent", async () => {
-  const prefs = ["favorites", "automatic_import"].map(name => ({
+  const prefs = ["favorites", "automatic_import", "report_watching"].map(name => ({
     dataset: {preference:name}, checked:true, disabled:false
   }));
   const calls = [], buttons = new Map();
@@ -40,4 +40,12 @@ test("switching members blocks stale preferences and unrelated updates omit impo
   assert.deepEqual(calls, [["profile","PUT",2,{favorites:false}]]);
   resolveRefresh();
   await save;
+
+  context.profileMember = 2;
+  prefs[2].checked = true;
+  const watching = prefs[2].onchange();
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.at(-1), ["profile", "PUT", 2, {report_watching:true}]);
+  resolveRefresh();
+  await watching;
 });

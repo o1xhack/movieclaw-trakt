@@ -9,6 +9,7 @@ class Preferences(BaseModel):
     manual_unwatched: bool = False
     favorites: bool = False
     automatic_import: bool = False
+    report_watching: bool = False
 
 
 async def preferences(engine, member):
@@ -19,4 +20,10 @@ async def preferences(engine, member):
     except ValueError:
         account = {}
     current = bool(account.get("generation")) and binding.get("generation") == account["generation"]
-    return Preferences.model_validate({**profile, "automatic_import": current})
+    return Preferences.model_validate(
+        {
+            **profile,
+            "automatic_import": current,
+            "report_watching": await engine.get(member, "report_watching", False),
+        }
+    )

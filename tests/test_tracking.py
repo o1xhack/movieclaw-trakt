@@ -872,3 +872,58 @@ async def test_stop_clears_a_start_committed_in_flight_after_the_player_stopped(
         "/users/me/watching",
         "/scrobble/pause",
     ]
+
+
+async def test_watching_is_off_by_default_but_completed_watches_still_sync(harness, event):
+    engine, _, clock, requests = await harness(report_watching=False)
+    for index, position in enumerate((0, 20_000, 40_000, 60_000)):
+        await engine.accept(
+            "started" if index == 0 else "progress",
+            {**event, "position_ms": position},
+            f"play-{index}",
+            iso_time(clock[0]),
+        )
+        await engine.drain(0)
+        clock[0] += 20
+    assert not requests
+    await engine.accept("completed", event, "complete", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [(r.method, r.url.path) for r in requests] == [
+        ("GET", "/sync/history/movies"),
+        ("POST", "/sync/history"),
+    ]
+    assert json.loads(requests[-1].content)["movies"][0]["watched_at"] == iso_time(
+        clock[0] // 60 * 60
+    )
+
+
+async def test_turning_watching_off_cancels_queued_start_and_clears_owned_status(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
+    await engine.accept("started", event, "started", started)
+    await engine.drain(0)
+    clock[0] += 20
+    other = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    await engine.accept("started", other, "queued", iso_time(clock[0]))
+    async with engine.locks[0]:
+        await engine.set(0, "report_watching", False)
+        await engine.disable_watching(0)
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+    assert json.loads(requests[-1].content)["progress"] == 90
+    clock[0] += 20
+    await engine.accept("completed", other, "complete", iso_time(clock[0]))
+    await engine.drain(0)
+    assert requests[-1].url.path == "/sync/history"

@@ -170,15 +170,27 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
             assert (await web.post(prefix + "/retry/missing")).status_code == 409
             assert (await store.get("account", scope="member:0"))["client_id"] == expected_id
             assert "fixture-a" not in json.dumps(status)
-            assert [r.url.path for r in requests].count("/scrobble/stop") == 1
+            assert sum(r.method == "POST" and r.url.path == "/sync/history" for r in requests) == 1
+            assert not any(r.url.path.startswith("/scrobble/") for r in requests)
             assert (await web.get(prefix + "/status?member_id=-1")).status_code == 422
             profile = {"manual_watched": True, "manual_unwatched": False, "favorites": True}
             assert (await web.put(prefix + "/profile", json=profile)).status_code == 200
             assert (await web.get(prefix + "/profile")).json()["preferences"] == {
                 **profile,
                 "automatic_import": False,
+                "report_watching": False,
             }
             assert (await web.get(prefix + "/profile?member_id=2")).json()["preferences"] != profile
+            assert (
+                await web.put(prefix + "/profile", json={"report_watching": True})
+            ).status_code == 200
+            assert (await web.get(prefix + "/profile")).json()["preferences"]["report_watching"]
+            assert not (await web.get(prefix + "/profile?member_id=2")).json()["preferences"][
+                "report_watching"
+            ]
+            assert (
+                await web.put(prefix + "/profile", json={"report_watching": False})
+            ).status_code == 200
             # 从真实 SDK 事件入口验证新增订阅，而非只调用 Actions 本身。
             from movieclaw_sdk.events import ItemFavorite, PlaybackMarked
 

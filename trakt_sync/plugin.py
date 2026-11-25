@@ -272,7 +272,8 @@ async def apply(ctx: Context):
         member = member_id
         async with engine.locks[member]:
             old = await preferences(engine, member)
-            payload = old.model_copy(update=payload.model_dump(exclude_unset=True))
+            changes = payload.model_dump(exclude_unset=True)
+            payload = old.model_copy(update=changes)
             binding = None
             if payload.automatic_import and not old.automatic_import:
                 if not engine.enabled or not (await engine.status(member))["connected"]:
@@ -286,7 +287,15 @@ async def apply(ctx: Context):
                     ) from exc
                 binding = {"generation": account["generation"], "member": owner}
             # Keep the v0.4 profile shape so a host package rollback can still read it.
-            await engine.set(member, "profile", payload.model_dump(exclude={"automatic_import"}))
+            await engine.set(
+                member,
+                "profile",
+                payload.model_dump(exclude={"automatic_import", "report_watching"}),
+            )
+            if "report_watching" in changes:
+                await engine.set(member, "report_watching", payload.report_watching)
+                if not payload.report_watching:
+                    await engine.disable_watching(member)
             if binding:
                 await engine.set(member, "automatic_import_binding", binding)
             elif old.automatic_import and not payload.automatic_import:

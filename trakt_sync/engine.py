@@ -633,6 +633,7 @@ class Engine(ActivityLog, Recovery):
                 "delivery",
                 "storage_error",
                 "automatic_import_binding",
+                "report_watching",
             ):
                 await self.store.delete(key, scope=self.scope(member))
             self.rotated.pop(member, None)
@@ -661,6 +662,25 @@ class Engine(ActivityLog, Recovery):
             await self.health.ok(f"member-{member}")
             return {"disconnected": True, "remote_revocation_confirmed": revoked}
 
+    async def disable_watching(self, member):
+        """The caller holds the member lock and has saved the preference."""
+        ledger = await self.ledger(member)
+        ledger["queue"][:] = [job for job in ledger["queue"] if job["path"] != "/scrobble/start"]
+        now = self.clock()
+        for marker in ("unconfirmed_start", "live_watching"):
+            if live := ledger.get(marker):
+                ledger.setdefault("watching_cleanups", {}).setdefault(
+                    live["key"],
+                    {
+                        "live": live,
+                        "stopped_at": now,
+                        "next_at": now,
+                        "expires_at": now + 300,
+                        "progress": live["progress"],
+                    },
+                )
+        await self.save_ledger(member, ledger)
+
     async def accept(self, kind, event, event_id, occurred_at):
         member = event.get("member_id")
         if not self.enabled or not isinstance(member, int) or member < 0:
@@ -687,6 +707,7 @@ class Engine(ActivityLog, Recovery):
                 return
             if event_id in ledger["seen"]:
                 return
+            report_watching = await self.get(member, "report_watching", False)
             item, rate = identity(event), progress(event)
             completed = kind == "completed" or (
                 kind == "stopped" and event.get("completed") is True
@@ -764,7 +785,7 @@ class Engine(ActivityLog, Recovery):
                             state.pop("terminal_at", None)
                             state.pop("session", None)
                             state["inferred_only"] = True
-                            if at >= state.get("retry_inferred_at", 0):
+                            if report_watching and at >= state.get("retry_inferred_at", 0):
                                 state["inferred_start"] = event_id
                                 request = {
                                     "path": "/scrobble/start",
@@ -810,6 +831,11 @@ class Engine(ActivityLog, Recovery):
                                 "path": "/scrobble/pause",
                                 "body": {**item, "progress": live["progress"]},
                             }
+            if request and not report_watching:
+                if request["path"] == "/scrobble/stop" and self.finished(request):
+                    request = {"path": "/sync/history", "body": history_body(item, occurred_at)}
+                elif request["path"] in {"/scrobble/start", "/scrobble/stop", "/scrobble/pause"}:
+                    request = None
             if item and kind in {"stopped", "completed"} and at >= state.get("at", 0):
                 state.pop("inferred_start", None)
                 ledger["queue"] = [
@@ -1132,7 +1158,10 @@ class Engine(ActivityLog, Recovery):
         else:
             try:
                 await self.pause_owned_watching(
-                    member, account, {**live, "progress": 100}, cleanup["stopped_at"]
+                    member,
+                    account,
+                    {**live, "progress": cleanup.get("progress", 100)},
+                    cleanup["stopped_at"],
                 )
             except TraktError as exc:
                 if exc.auth_error:
@@ -1192,6 +1221,17 @@ class Engine(ActivityLog, Recovery):
                 ledger["queue"][:] = [j for j in ledger["queue"] if j["id"] != job["id"]]
                 await self.save_ledger(member, ledger)
                 return
+            if not await self.get(member, "report_watching", False):
+                if job["path"] == "/scrobble/start" or (
+                    job["path"] == "/scrobble/stop" and not self.finished(job)
+                ):
+                    ledger["queue"].pop(0)
+                    await self.save_ledger(member, ledger)
+                    await self.complete_activity(member, job, "expired")
+                    return
+                if job["path"] == "/scrobble/stop" and not job["uncertain"]:
+                    job["path"] = "/sync/history"
+                    job["body"] = history_body(job["item"], job["occurred_at"])
             try:
                 if job.get("source") and (job.get("attempt") or job.get("repair_attempt")):
                     job["revalidate"] = True
