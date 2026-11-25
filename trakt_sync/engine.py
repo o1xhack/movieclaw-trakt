@@ -1086,6 +1086,12 @@ class Engine(ActivityLog, Recovery):
         return result
 
     async def pause_owned_watching(self, member, account, live):
+        end = live.get("window_end")
+        if end is None:
+            acknowledged = live.get("ack_at")
+            if acknowledged is None:
+                return
+            end = acknowledged + 1
         current = await self.authorized(member, account, "GET", "/users/me/watching")
         if not isinstance(current, dict):
             raise TraktError(502)
@@ -1096,7 +1102,6 @@ class Engine(ActivityLog, Recovery):
             started_at = timestamp(started)
         except (AttributeError, TypeError, ValueError):
             return
-        end = live.get("window_end", live.get("ack_at", live["sent_at"] + 14) + 1)
         if int(live["sent_at"]) <= started_at <= end:
             await self.authorized(
                 member,
@@ -1203,12 +1208,17 @@ class Engine(ActivityLog, Recovery):
                         else:
                             live = self.watching_for(ledger, job["key"])
                             if job.get("clear_watching") and not late and live:
-                                await self.pause_owned_watching(
-                                    member, account, {**live, "progress": 100}
-                                )
-                                for marker in ("live_watching", "unconfirmed_start"):
-                                    if ledger.get(marker, {}).get("key") == job["key"]:
-                                        ledger.pop(marker)
+                                try:
+                                    await self.pause_owned_watching(
+                                        member, account, {**live, "progress": 100}
+                                    )
+                                except TraktError as exc:
+                                    if exc.auth_error or exc.status == 429:
+                                        raise
+                                else:
+                                    for marker in ("live_watching", "unconfirmed_start"):
+                                        if ledger.get(marker, {}).get("key") == job["key"]:
+                                            ledger.pop(marker)
                             # Persist the change of write contract before POST. If this
                             # response is lost too, reconcile its explicit source minute.
                             job.pop("scrobble_window", None)

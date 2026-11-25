@@ -779,3 +779,41 @@ async def test_slow_watching_lookup_never_sends_an_expired_start(harness, event)
         )
     await engine.drain(0)
     assert [r.url.path for r in requests] == ["/users/me/watching"]
+
+
+async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(harness, event):
+    def handler(request):
+        if request.url.path == "/scrobble/start":
+            raise httpx.ReadError("lost start response", request=request)
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(503)
+        if request.method == "GET" and request.url.path == "/sync/history/movies":
+            return httpx.Response(200, json=[])
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    payload = {**event, "viewing_id": "same-session"}
+    await engine.accept("started", payload, "start", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 5
+    await engine.accept("completed", payload, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/sync/history/movies",
+        "/users/me/watching",
+        "/sync/history",
+    ]
+
+
+async def test_legacy_watching_without_recorded_bounds_is_not_cleared(harness, event):
+    engine, _, clock, requests = await harness()
+    await engine.accept("started", event, "start", iso_time(clock[0]))
+    await engine.drain(0)
+    ledger = await engine.ledger(0)
+    ledger["live_watching"].pop("window_end")
+    await engine.save_ledger(0, ledger)
+    clock[0] += 5
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/start"]
