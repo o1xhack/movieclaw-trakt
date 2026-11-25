@@ -706,3 +706,26 @@ async def test_watching_lookup_outage_does_not_delay_another_completion(harness,
     clock[0] += 1
     await engine.drain(0)
     assert [r.url.path for r in requests] == ["/users/me/watching", "/scrobble/stop"]
+
+
+async def test_watching_rate_limit_also_delays_other_queued_writes(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(429, headers={"Retry-After": "300"})
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+    other = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    await engine.accept("completed", other, "other-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 299
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching"]
+    clock[0] += 2
+    await engine.drain(0)
+    assert [r.url.path for r in requests][1:] == ["/sync/history/movies", "/sync/history"]

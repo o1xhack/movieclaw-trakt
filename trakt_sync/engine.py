@@ -305,7 +305,11 @@ class Engine(ActivityLog, Recovery):
             else [j["retry_at"] for j in ledger.get("failed", []) if "retry_at" in j]
         )
         if deadlines:
-            await self.set(member, "delivery", {"next_at": min(deadlines)})
+            await self.set(
+                member,
+                "delivery",
+                {"next_at": max(min(deadlines), ledger.get("requests_not_before", 0))},
+            )
         await self.set(member, "ledger", ledger)
         if not deadlines:
             await self.store.delete("delivery", scope=self.scope(member))
@@ -739,10 +743,8 @@ class Engine(ActivityLog, Recovery):
                     state.update(sample_at=at, sample_position=position)
                     if live.get("key") == key:
                         live["progress"] = rate
-                    elif (
-                        (not state.get("session") or state.get("closed"))
-                        and not state.get("inferred_start")
-                        and at >= state.get("retry_inferred_at", 0)
+                    elif (not state.get("session") or state.get("closed")) and not state.get(
+                        "inferred_start"
                     ):
                         # A seek can move the position without playback. Require two
                         # consecutive advances at a plausible rate before inferring a start.
@@ -756,12 +758,14 @@ class Engine(ActivityLog, Recovery):
                             state.pop("closed", None)
                             state.pop("terminal_at", None)
                             state.pop("session", None)
-                            state.update(inferred_only=True, inferred_start=event_id)
-                            request = {
-                                "path": "/scrobble/start",
-                                "body": {**item, "progress": rate},
-                                "inferred": True,
-                            }
+                            state["inferred_only"] = True
+                            if at >= state.get("retry_inferred_at", 0):
+                                state["inferred_start"] = event_id
+                                request = {
+                                    "path": "/scrobble/start",
+                                    "body": {**item, "progress": rate},
+                                    "inferred": True,
+                                }
                 elif not state.get("closed") or (completed and "terminal_at" not in state):
                     state["at"] = at
                     live = ledger.get("live_watching", {})
@@ -1010,50 +1014,36 @@ class Engine(ActivityLog, Recovery):
                 raise
             # An optional start must not delay a real stop or viewing record in the queue.
             retry_after = max(60, exc.retry_after)
+            if exc.status == 429:
+                ledger["requests_not_before"] = self.clock() + exc.retry_after
         state.pop("inferred_start", None)
         state["moving_reports"] = 0
         state["retry_inferred_at"] = self.clock() + retry_after
         return {"action": "expired"}
 
     async def start_watching(self, member, account, ledger, job):
-        previous = ledger.get("live_watching")
-
-        async def restore():
-            if previous:
-                ledger["live_watching"] = previous
-            else:
-                ledger.pop("live_watching", None)
-            await self.save_ledger(member, ledger)
+        sent_at = self.clock()
 
         async def before_send():
-            now = self.clock()
-            ledger["live_watching"] = {
-                "key": job["key"],
-                "item": job["item"],
-                "generation": job["generation"],
-                "sent_at": now,
-                "progress": job["body"]["progress"],
-            }
-            await self.save_inflight(member, ledger, job)
+            nonlocal sent_at
+            sent_at = self.clock()
 
-        try:
-            result = await self.authorized(
-                member,
-                account,
-                "POST",
-                job["path"],
-                job["body"],
-                before_send=before_send,
-                after_rejection=restore,
-            )
-            ledger["live_watching"]["ack_at"] = self.clock()
-            return result
-        except TraktError as exc:
-            if not exc.uncertain:
-                await restore()
-            raise
+        result = await self.authorized(
+            member, account, "POST", job["path"], job["body"], before_send=before_send
+        )
+        # A lost start response is not proof that Trakt accepted this session.
+        ledger["live_watching"] = {
+            "key": job["key"],
+            "item": job["item"],
+            "sent_at": sent_at,
+            "ack_at": self.clock(),
+            "progress": job["body"]["progress"],
+        }
+        return result
 
     async def pause_owned_watching(self, member, account, live):
+        if "ack_at" not in live:
+            return
         current = await self.authorized(member, account, "GET", "/users/me/watching")
         if not isinstance(current, dict):
             raise TraktError(502)
@@ -1064,7 +1054,7 @@ class Engine(ActivityLog, Recovery):
             started_at = timestamp(started)
         except (AttributeError, TypeError, ValueError):
             return
-        if int(live["sent_at"]) <= started_at <= live.get("ack_at", live["sent_at"]) + 1:
+        if int(live["sent_at"]) <= started_at <= live["ack_at"] + 1:
             await self.authorized(
                 member,
                 account,
@@ -1086,6 +1076,8 @@ class Engine(ActivityLog, Recovery):
                 return
             await self.store.delete("storage_error", scope=self.scope(member))
             ledger = await self.ledger(member)
+            if self.clock() < ledger.get("requests_not_before", 0):
+                return
             if not ledger["queue"]:
                 await self._retry_locked(member, automatic=True)
                 ledger = await self.ledger(member)
