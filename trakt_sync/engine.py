@@ -778,11 +778,23 @@ class Engine(ActivityLog, Recovery):
                         state.pop("moving_reports", None)
                         if rate is not None and rate > 80:
                             state["terminal_at"] = at
-                        if state.get("inferred_only") and not live:
+                        if (
+                            state.get("inferred_only")
+                            and ledger.get("live_watching", {}).get("key") != key
+                        ):
                             if rate is not None and rate > 80:
                                 request = {
                                     "path": "/sync/history",
                                     "body": history_body(item, occurred_at),
+                                    "clear_watching": bool(live),
+                                }
+                            elif live:
+                                request = {
+                                    "path": "/scrobble/pause",
+                                    "body": {
+                                        **item,
+                                        "progress": rate if rate is not None else live["progress"],
+                                    },
                                 }
                         elif rate is not None:
                             request = {
@@ -1032,6 +1044,8 @@ class Engine(ActivityLog, Recovery):
         return {}
 
     async def start_watching(self, member, account, ledger, job):
+        previous = ledger.get("unconfirmed_start")
+
         async def before_send():
             now = self.clock()
             if now - timestamp(job["occurred_at"]) > 300:
@@ -1046,7 +1060,10 @@ class Engine(ActivityLog, Recovery):
             await self.save_inflight(member, ledger, job)
 
         async def clear_rejected():
-            ledger.pop("unconfirmed_start", None)
+            if previous:
+                ledger["unconfirmed_start"] = previous
+            else:
+                ledger.pop("unconfirmed_start", None)
             await self.save_ledger(member, ledger)
 
         try:
@@ -1079,7 +1096,8 @@ class Engine(ActivityLog, Recovery):
             started_at = timestamp(started)
         except (AttributeError, TypeError, ValueError):
             return
-        if int(live["sent_at"]) <= started_at <= live["window_end"]:
+        end = live.get("window_end", live.get("ack_at", live["sent_at"] + 14) + 1)
+        if int(live["sent_at"]) <= started_at <= end:
             await self.authorized(
                 member,
                 account,
@@ -1213,7 +1231,9 @@ class Engine(ActivityLog, Recovery):
                     elif job["path"] == "/scrobble/pause":
                         live = self.watching_for(ledger, job["key"])
                         if live:
-                            await self.pause_owned_watching(member, account, live)
+                            await self.pause_owned_watching(
+                                member, account, {**live, "progress": job["body"]["progress"]}
+                            )
                         result = {"action": "pause"}
                     else:
                         result = await self.authorized(

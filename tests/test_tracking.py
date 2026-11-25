@@ -528,6 +528,10 @@ async def test_stop_without_duration_runs_watching_cleanup_immediately(harness, 
     started = iso_time(clock[0])
     await engine.accept("started", event, "start", started)
     await engine.drain(0)
+    ledger = await engine.ledger(0)
+    live = ledger["live_watching"]
+    live["ack_at"] = live.pop("window_end") - 1
+    await engine.save_ledger(0, ledger)
     clock[0] += 10
     await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
     await engine.drain(0)
