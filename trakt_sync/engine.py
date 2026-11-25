@@ -348,10 +348,18 @@ class Engine(ActivityLog, Recovery):
                 for scope, ledger in ledgers.items():
                     if not (ledger.get("live_watching") or ledger.get("unconfirmed_start")):
                         continue
-                    member = int(scope.split(":", 1)[1])
-                    async with self.locks[member]:
-                        if not await self.get(member, "report_watching", False):
-                            await self.disable_watching(member)
+                    value = scope.split(":", 1)[-1]
+                    if not value.isdigit():
+                        continue
+                    member = int(value)
+                    try:
+                        async with self.locks[member]:
+                            if not await self.get(member, "report_watching", False):
+                                await self.disable_watching(member)
+                    except Exception as exc:
+                        self.log.warning(
+                            "Trakt 单个成员的正在观看状态无法清理（%s）", type(exc).__name__
+                        )
                 await self.store.set("watching-opt-in-v1", True)
             if indexed:
                 return
@@ -680,18 +688,21 @@ class Engine(ActivityLog, Recovery):
         ledger = await self.ledger(member)
         ledger["queue"][:] = [job for job in ledger["queue"] if job["path"] != "/scrobble/start"]
         now = self.clock()
+        cleanups = ledger.setdefault("watching_cleanups", {})
         for marker in ("unconfirmed_start", "live_watching"):
-            if live := ledger.get(marker):
-                ledger.setdefault("watching_cleanups", {}).setdefault(
-                    f"{live['key']}:{live['sent_at']}",
-                    {
-                        "live": live,
-                        "stopped_at": now,
-                        "next_at": now,
-                        "expires_at": now + 300,
-                        "progress": live["progress"],
-                    },
-                )
+            live = ledger.get(marker)
+            if not live or any(
+                entry["live"]["key"] == live["key"] and entry["live"]["sent_at"] == live["sent_at"]
+                for entry in cleanups.values()
+            ):
+                continue
+            cleanups[f"{live['key']}:{live['sent_at']}"] = {
+                "live": live,
+                "stopped_at": now,
+                "next_at": now,
+                "expires_at": now + 300,
+                "progress": live["progress"],
+            }
         await self.save_ledger(member, ledger)
 
     async def accept(self, kind, event, event_id, occurred_at):

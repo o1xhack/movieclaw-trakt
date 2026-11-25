@@ -964,3 +964,45 @@ async def test_default_off_upgrade_clears_the_acknowledged_start_after_an_uncert
         "/users/me/watching",
         "/scrobble/pause",
     ]
+
+
+async def test_opt_out_preserves_an_existing_cleanup_for_the_same_start(harness, event):
+    engine, _, clock, _ = await harness()
+    await engine.accept("started", {**event, "position_ms": 20_000}, "start", iso_time(clock[0]))
+    await engine.drain(0)
+    ledger = await engine.ledger(0)
+    live = ledger["live_watching"]
+    completion_cleanup = {
+        "live": live,
+        "stopped_at": clock[0],
+        "next_at": clock[0] + 60,
+        "expires_at": clock[0] + 300,
+    }
+    ledger["watching_cleanups"] = {live["key"]: completion_cleanup}
+    await engine.save_ledger(0, ledger)
+    async with engine.locks[0]:
+        await engine.set(0, "report_watching", False)
+        await engine.disable_watching(0)
+    assert (await engine.ledger(0))["watching_cleanups"] == {live["key"]: completion_cleanup}
+
+
+async def test_watching_upgrade_recovers_other_members_if_one_ledger_write_fails(
+    harness, event, monkeypatch
+):
+    engine, store, clock, _ = await harness()
+    await engine.accept("started", event, "start", iso_time(clock[0]))
+    await engine.drain(0)
+    await store.delete("report_watching", scope="member:0")
+    await store.set("delivery-index-v3", True)
+    await engine.set(2, "ledger", await engine.ledger(0))
+    set_value = store.set
+
+    async def fail_one_ledger(key, value, *, scope="global", secret=False):
+        if (scope, key) == ("member:0", "ledger"):
+            raise OSError("fixture storage failure")
+        await set_value(key, value, scope=scope, secret=secret)
+
+    monkeypatch.setattr(store, "set", fail_one_ledger)
+    await engine.initialize()
+    assert not (await engine.ledger(0)).get("watching_cleanups")
+    assert (await engine.ledger(2))["watching_cleanups"]
