@@ -16,6 +16,7 @@ KINDS = ("movies", "episodes")
 POLL = 300
 CATALOG_CHECK = 1800
 SNAPSHOT_PAGE = 400
+TARGET_LIMIT = 12
 
 
 class Superseded(Exception):
@@ -221,45 +222,45 @@ class BackgroundImport:
                 raise RetryScan("MovieClaw 媒体库分页未前进")
             cursor = next_cursor
 
-    async def history(self, member, generation, path):
+    async def paged_rows(self, member, generation, path, params=None, *, until_empty=False):
         page, seen_pages = 1, set()
         while True:
-            rows = await self.fetch(member, generation, path, {"page": page, "limit": 100})
+            rows = await self.fetch(
+                member, generation, path, {**(params or {}), "page": page, "limit": 100}
+            )
             if not isinstance(rows, list):
                 raise TraktError(502)
             marker = digest(rows)
             if rows and marker in seen_pages:
-                raise RetryScan("Trakt 返回了重复历史分页")
+                raise RetryScan("Trakt 返回了重复分页")
             seen_pages.add(marker)
             for row in rows:
                 yield row
-            if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
+            pages = getattr(rows, "page_count", 0)
+            if not rows or (pages and page >= pages) or (not pages and not until_empty):
                 return
             page += 1
 
     async def watched_snapshot(self, member, generation, kind):
         # Trakt exposes last_updated_at by title, independent of the viewing date.
         item_type = "movie" if kind == "movies" else "show"
+        result = {}
         try:
-            rows = await self.fetch(
+            async for row in self.paged_rows(
                 member,
                 generation,
                 f"/sync/watched/{item_type}s",
                 {"extended": "noseasons"} if item_type == "show" else None,
-            )
+            ):
+                trakt_id = row.get(item_type, {}).get("ids", {}).get("trakt")
+                updated = row.get("last_updated_at")
+                if type(trakt_id) is not int or trakt_id <= 0 or not isinstance(updated, str):
+                    return None
+                result[str(trakt_id)] = updated
         except TraktError as exc:
-            if exc.status in {400, 404, 422}:
+            if exc.status in {400, 404, 422, 502}:
                 return None
             raise
-        if not isinstance(rows, list):
-            return None
-        result = {}
-        for row in rows:
-            trakt_id = row.get(item_type, {}).get("ids", {}).get("trakt")
-            updated = row.get("last_updated_at")
-            if type(trakt_id) is not int or trakt_id <= 0 or not isinstance(updated, str):
-                return None
-            result[str(trakt_id)] = updated
         return result
 
     @staticmethod
@@ -279,7 +280,7 @@ class BackgroundImport:
             for target in sorted(targets or {""}):
                 title_kind = "movies" if kind == "movies" else "shows"
                 path = f"/sync/history/{title_kind}/{target}" if target else canonical
-                async for row in self.history(member, generation, path):
+                async for row in self.paged_rows(member, generation, path, until_empty=True):
                     record_id = row.get("id")
                     if type(record_id) is not int or not 0 < record_id < 2**64:
                         raise TraktError(502)
@@ -445,12 +446,12 @@ class BackgroundImport:
                     elif status in {"conflict", "not_found"}:
                         versions[key] = False
                         conflict = True
-                    else:
-                        # A source may already be anchored by the host to a different media row.
-                        # Keep it and report the mismatch, avoiding an endless full-scan retry.
-                        held += 1
-                        done.add(remote_id)
+                    elif status == "mismatch":
+                        # This also covers metadata changing after the catalog was read.
+                        # Keep it pending for the next change to the catalog or this title.
                         versions[key] = False
+                    else:
+                        raise RetryScan("MovieClaw 返回了未知的导入结果")
                 await self.e.record_activities(member, activity, inbound=True)
                 await records.finish(done)
                 finished.update(done)
@@ -469,6 +470,11 @@ class BackgroundImport:
             namespace = await self.e.import_identity(member)
         records = ImportRecords(self.e.store, member, digest([owner, namespace]))
         revision = self.library_revision
+        before = await records.pending()
+        if not (changed or before or state.get("pending_retry")):
+            self.catalog_revision[member] = revision
+            state["catalog_due"] = self.e.clock() + CATALOG_CHECK
+            return state
         units, index = await self.catalog(member)
         inventory = {
             unit_key(unit): digest(external_ids(identity({"media": unit["media"], "unit": unit})))[
@@ -480,7 +486,6 @@ class BackgroundImport:
         previous_inventory = await self.snapshot(member, "inventory", generation)
         inventory_changed = inventory != previous_inventory
         if changed or inventory_changed or state.get("attempt") or state.get("pending_retry"):
-            before = await records.pending()
             pending = dict(before)
             snapshots = {}
             changed_records = set()
@@ -496,7 +501,7 @@ class BackgroundImport:
                         for key in remote.keys() | previous.keys()
                         if remote.get(key) != previous.get(key)
                     }
-                    if delta:
+                    if 0 < len(delta) <= TARGET_LIMIT:
                         targets = delta
                 # A changed activity stamp without a usable delta can be a same-date
                 # replacement or a server without the minimal watched snapshot.
@@ -538,6 +543,10 @@ class BackgroundImport:
             async with self.e.locks[member]:
                 await self.account(member, generation)
                 await self.verify_member(member)
+                # If interrupted while persisting these indexes, reconsider all staged
+                # records on restart, even if the inventory fingerprint is unchanged.
+                state["pending_retry"] = True
+                await self.e.set(member, "background_import", state)
                 await records.save_pending(before, pending)
                 for kind, (remote, previous) in snapshots.items():
                     await self.save_snapshot(member, f"remote_{kind}", generation, remote, previous)
@@ -546,7 +555,7 @@ class BackgroundImport:
                         member, "inventory", generation, inventory, previous_inventory
                     )
                 # Incoming records and the checkpoint become durable before any remote write.
-                state.update(stamp=stamp, record_ledger=True, pending_retry=True)
+                state.update(stamp=stamp, record_ledger=True)
                 await self.e.set(member, "background_import", state)
             applied, held, conflict, finished = await self.apply(
                 member, generation, records, candidates

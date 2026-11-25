@@ -32,6 +32,11 @@ class Store:
     async def delete(self, key, *, scope="global"):
         return self.data.pop((scope, key), None) is not None
 
+    async def items(self, *, scope="global"):
+        return {
+            key: copy.deepcopy(value) for (owner, key), value in self.data.items() if owner == scope
+        }
+
     async def scopes(self, key, *, entity=None):
         self.scans.append(key)
         return {

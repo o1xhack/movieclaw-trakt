@@ -230,8 +230,10 @@ async def test_scheduler_reacts_to_inventory_and_stops_on_cancel(harness):
     try:
         await wait_until_idle(1)
         worker.inventory_changed()
-        await wait_until_idle(2)
-        assert host.calls["playback.sync.catalog"] == 2
+        async with asyncio.timeout(2):
+            while worker.catalog_revision.get(0) != worker.library_revision or worker.active:
+                await asyncio.sleep(0.01)
+        assert host.calls["playback.sync.catalog"] == 1
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -478,3 +480,53 @@ async def test_new_play_for_same_title_never_resends_old_source_after_local_rese
     await worker.process(0)
     assert [r["episode"] for r in host.records.values()] == [2, 1]
     assert host.units[1]["played"]
+
+
+async def test_catalog_mismatch_retries_after_title_becomes_matchable(harness):
+    row = episode(1, 1, "2020-01-01T11:00:00Z")
+
+    def trakt(request):
+        if request.url.path == "/sync/last_activities":
+            return httpx.Response(200, json={"episodes": {"watched_at": row["watched_at"]}})
+        if request.url.path == "/sync/history/episodes":
+            return httpx.Response(200, json=[row], headers={"X-Pagination-Page-Count": "1"})
+        return None
+
+    class ReidentifiedHost(Host):
+        async def call(self, op, body):
+            if op == "playback.sync.import" and self.units[1]["media"]["id"] == 70:
+                return {"outcomes": [{"status": "mismatch"}]}
+            return await super().call(op, body)
+
+    engine, _, _, requests = await harness(trakt)
+    host = ReidentifiedHost([local_episode(1)])
+    worker = BackgroundImport(engine, host)
+    await opt_in(engine, worker)
+    await worker.process(0)
+    assert not host.records
+    host.units[1]["media"]["id"] = 71
+    requests.clear()
+    worker.inventory_changed()
+    await worker.process(0)
+    assert next(iter(host.records.values()))["media_item_id"] == 71
+    assert not any(r.url.path.startswith("/sync/history") for r in requests)
+
+
+async def test_watched_index_reads_all_pages_before_using_title_deltas(harness):
+    def trakt(request):
+        assert request.url.path == "/sync/watched/shows"
+        page = int(request.url.params["page"])
+        return httpx.Response(
+            200,
+            json=[{"show": {"ids": {"trakt": page}}, "last_updated_at": str(page)}],
+            headers={"X-Pagination-Page-Count": "2"},
+        )
+
+    engine, _, _, _ = await harness(trakt)
+    worker = BackgroundImport(engine, Host([]))
+    await opt_in(engine, worker)
+    account = await engine.get(0, "account")
+    assert await worker.watched_snapshot(0, account["generation"], "episodes") == {
+        "1": "1",
+        "2": "2",
+    }

@@ -758,8 +758,14 @@ class Engine(ActivityLog, Recovery):
                                     "path": "/scrobble/start",
                                     "body": {**item, "progress": rate},
                                 }
+            if item and kind in {"stopped", "completed"} and at >= state.get("at", 0):
+                ledger["queue"] = [
+                    job
+                    for job in ledger["queue"]
+                    if not (job["key"] == key and job["path"] == "/scrobble/start")
+                ]
             if request:
-                # 同一播放尚未发出的心跳只保留最新一条；停止事件不会被它覆盖。
+                # 同一播放尚未发出的开始请求只保留最新一条。
                 if request["path"] == "/scrobble/start":
                     ledger["watching"] = key
                     ledger["queue"] = [

@@ -586,3 +586,13 @@ async def test_stop_without_duration_runs_watching_cleanup_immediately(harness, 
         "/users/me/watching",
         "/scrobble/pause",
     ]
+
+
+async def test_stop_without_duration_cancels_start_that_is_still_queued(harness, event):
+    engine, store, clock, requests = await harness()
+    await engine.accept("started", event, "start", iso_time(clock[0]))
+    clock[0] += 5
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert not requests
+    assert not await store.get("delivery", scope="member:0")
