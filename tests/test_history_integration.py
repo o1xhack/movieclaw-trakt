@@ -81,7 +81,13 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                 200, json={"user": {"username": "fixture-two", "ids": {"uuid": "fixture-two-uuid"}}}
             )
         if r.url.path == "/sync/last_activities":
-            return httpx.Response(200, json={"movies": {"watched_at": "2020-01-04T00:00:00Z"}})
+            return httpx.Response(
+                200,
+                json={
+                    "movies": {"watched_at": "2020-01-04T00:00:00Z"},
+                    "episodes": {"watched_at": "2020-01-04T00:00:00Z"},
+                },
+            )
         if r.url.path.startswith("/sync/watched/"):
             return httpx.Response(200, json={})
         if r.url.path == "/search/tmdb/200":
@@ -632,9 +638,9 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     row["event"] == "history_import" and row["episode"] == 2 for row in incoming
                 )
                 assert any(row["event"] == "history_export" for row in activity["records"])
-                assert [r.url.path for r in requests[request_offset:]].count(
-                    "/sync/history/shows/800"
-                ) == 1
+                assert not any(
+                    r.url.path.startswith("/sync/history/") for r in requests[request_offset:]
+                )
                 assert all(r.method == "GET" for r in requests[request_offset:])
                 async with get_database().session() as s:
                     watched_episodes = list(

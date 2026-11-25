@@ -29,6 +29,10 @@ class DeliveryEvicted(Exception):
     """Capacity trimming removed the job before its request was sent."""
 
 
+WATCHING_IDLE = 150
+WATCHING_RETRY = 60
+
+
 class Engine(ActivityLog, Recovery):
     def __init__(
         self, store, client, health, logger, *, enabled=True, clock=time.time, resolver=None
@@ -299,6 +303,8 @@ class Engine(ActivityLog, Recovery):
             if queue
             else [j["retry_at"] for j in ledger.get("failed", []) if "retry_at" in j]
         )
+        if live := ledger.get("live_watching"):
+            deadlines.append(live["next_at"])
         if deadlines:
             await self.set(member, "delivery", {"next_at": min(deadlines)})
         await self.set(member, "ledger", ledger)
@@ -309,6 +315,7 @@ class Engine(ActivityLog, Recovery):
     async def block_auth(self, member, account, ledger):
         current = await self.get(member, "account", account)
         await self.set(member, "account", {**current, "blocked": True}, secret=True)
+        ledger.pop("live_watching", None)
         ledger.update(
             queue=[],
             failed=[],
@@ -716,28 +723,41 @@ class Engine(ActivityLog, Recovery):
                         state["terminal_at"] = at
             elif item and at >= state.get("at", 0):
                 if kind == "started":
-                    state = {"session": event_id, "at": at, "last_start": at}
+                    state = {"session": event_id, "at": at, "position": event.get("position_ms")}
                     request = {
                         "path": "/scrobble/start",
                         "body": {**item, "progress": rate or 0},
                     }
                 elif not state.get("closed") or (completed and "terminal_at" not in state):
                     state["at"] = at
-                    if kind in ("stopped", "completed") and rate is not None:
+                    live = ledger.get("live_watching", {})
+                    if kind in ("stopped", "completed"):
                         state["closed"] = True
-                        if rate > 80:
+                        if rate is not None and rate > 80:
                             state["terminal_at"] = at
-                        request = {
-                            "path": "/scrobble/stop",
-                            "body": {**item, "progress": rate},
-                        }
-                    elif kind == "progress" and rate is not None:
-                        if at - state.get("last_start", 0) >= 60:
-                            state["last_start"] = at
+                        if rate is not None:
                             request = {
-                                "path": "/scrobble/start",
+                                "path": "/scrobble/stop",
                                 "body": {**item, "progress": rate},
                             }
+                        elif live.get("key") == key:
+                            # A stop with no usable progress still ends the live status.
+                            live["next_at"] = self.clock()
+                    elif kind == "progress" and rate is not None:
+                        position = event.get("position_ms")
+                        previous_position = state.get("position")
+                        state["position"] = position
+                        if previous_position is not None and position != previous_position:
+                            if live.get("key") == key:
+                                live.update(progress=rate, next_at=at + WATCHING_IDLE)
+                            elif not live and not any(
+                                j["key"] == key and j["path"] == "/scrobble/start"
+                                for j in ledger["queue"]
+                            ):
+                                request = {
+                                    "path": "/scrobble/start",
+                                    "body": {**item, "progress": rate},
+                                }
             if request:
                 # 同一播放尚未发出的心跳只保留最新一条；停止事件不会被它覆盖。
                 if request["path"] == "/scrobble/start":
@@ -929,6 +949,79 @@ class Engine(ActivityLog, Recovery):
             if window := job.get("scrobble_window"):
                 window["end"] = iso_time(max(timestamp(window["start"]), self.clock()))
 
+    async def start_watching(self, member, account, ledger, job):
+        previous = ledger.get("live_watching")
+
+        async def restore():
+            if previous:
+                ledger["live_watching"] = previous
+            else:
+                ledger.pop("live_watching", None)
+            await self.save_ledger(member, ledger)
+
+        async def before_send():
+            now = self.clock()
+            ledger["live_watching"] = {
+                "key": job["key"],
+                "item": job["item"],
+                "generation": job["generation"],
+                "sent_at": now,
+                "next_at": max(now, timestamp(job["occurred_at"]) + WATCHING_IDLE),
+                "progress": job["body"]["progress"],
+            }
+            await self.save_inflight(member, ledger, job)
+
+        try:
+            return await self.authorized(
+                member,
+                account,
+                "POST",
+                job["path"],
+                job["body"],
+                before_send=before_send,
+                after_rejection=restore,
+            )
+        except TraktError as exc:
+            if not exc.uncertain:
+                await restore()
+            raise
+
+    async def clear_idle_watching(self, member, account, ledger):
+        live = ledger["live_watching"]
+        if live["generation"] == account["generation"]:
+            try:
+                current = await self.authorized(member, account, "GET", "/users/me/watching")
+                started = current.get("started_at")
+                if (
+                    started
+                    and current.get("action") != "checkin"
+                    and matches(live["item"], current)
+                ):
+                    try:
+                        started_at = timestamp(started)
+                    except (AttributeError, TypeError, ValueError):
+                        started_at = 0
+                    if live["sent_at"] - 2 <= started_at <= live["sent_at"] + 15:
+                        await self.authorized(
+                            member,
+                            account,
+                            "POST",
+                            "/scrobble/pause",
+                            {**live["item"], "progress": max(1.0, live["progress"])},
+                        )
+            except TraktError as exc:
+                if exc.auth_error:
+                    await self.block_auth(member, account, ledger)
+                    return
+                if exc.status not in {404, 422}:
+                    live["next_at"] = self.clock() + max(WATCHING_RETRY, exc.retry_after)
+                    await self.save_ledger(member, ledger)
+                    return
+        ledger.pop("live_watching", None)
+        if ledger.get("watching") == live["key"]:
+            ledger.pop("watching", None)
+        await self.save_ledger(member, ledger)
+
     async def drain(self, member):
         async with self.locks[member]:
             account = await self.get(member, "account", {})
@@ -942,6 +1035,13 @@ class Engine(ActivityLog, Recovery):
                 return
             await self.store.delete("storage_error", scope=self.scope(member))
             ledger = await self.ledger(member)
+            if (
+                (not ledger["queue"] or ledger["queue"][0]["next_at"] > self.clock())
+                and (live := ledger.get("live_watching"))
+                and live["next_at"] <= self.clock()
+            ):
+                await self.clear_idle_watching(member, account, ledger)
+                return
             if not ledger["queue"]:
                 await self._retry_locked(member, automatic=True)
                 ledger = await self.ledger(member)
@@ -1056,6 +1156,11 @@ class Engine(ActivityLog, Recovery):
                             )
                     elif finished and job["path"] == "/scrobble/stop":
                         result = await self.native_stop(member, account, ledger, job)
+                    elif job["path"] == "/scrobble/start":
+                        if self.clock() - timestamp(job["occurred_at"]) >= WATCHING_IDLE:
+                            result = {"action": "expired"}
+                        else:
+                            result = await self.start_watching(member, account, ledger, job)
                     else:
                         result = await self.authorized(
                             member, account, "POST", job["path"], job["body"]
@@ -1157,6 +1262,12 @@ class Engine(ActivityLog, Recovery):
                 ledger["queue"][0]["next_at"] = max(ledger["queue"][0]["next_at"], self.clock() + 1)
             if job["path"] != "/scrobble/start" and ledger.get("watching") == job["key"]:
                 ledger.pop("watching", None)
+            if (
+                job["path"] in {"/scrobble/stop", "/scrobble/pause"}
+                and result.get("action") not in {"expired", "manual_unwatched", "local_deleted"}
+                and ledger.get("live_watching", {}).get("key") == job["key"]
+            ):
+                ledger.pop("live_watching", None)
             if result.get("action") not in {"expired", "manual_unwatched"}:
                 ledger["last_success"] = iso_time(self.clock())
             ledger["last_error"] = (

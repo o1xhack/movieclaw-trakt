@@ -92,29 +92,15 @@ async def test_late_episode_backdated_updates_and_restart(harness):
                     "episodes": {"watched_at": stamp[0]},
                 },
             )
-        if path == "/sync/watched/episodes":
-            assert request.url.params["extended"] == "min"
-            snapshot = {}
-            for row in rows:
-                snapshot.setdefault(str(row["episode"]["ids"]["trakt"]), []).append(
-                    row["watched_at"]
-                )
-            return httpx.Response(200, json=snapshot)
+        if path == "/sync/watched/shows":
+            assert request.url.params["extended"] == "noseasons"
+            return httpx.Response(
+                200, json=[{"show": {"ids": {"trakt": 800}}, "last_updated_at": stamp[0]}]
+            )
         if path == "/sync/watched/movies":
-            return httpx.Response(200, json={})
-        if path == "/search/tmdb/200":
-            return httpx.Response(200, json=[{"show": {"ids": {"tmdb": 200, "trakt": 800}}}])
-        if path in {
-            "/sync/history/episodes",
-            "/sync/history/shows/800",
-            "/sync/history/episodes/102",
-        }:
-            selected = [
-                r
-                for r in rows
-                if path != "/sync/history/episodes/102" or r["episode"]["number"] == 2
-            ]
-            return httpx.Response(200, json=selected, headers={"X-Pagination-Page-Count": "1"})
+            return httpx.Response(200, json=[])
+        if path in {"/sync/history/episodes", "/sync/history/shows/800"}:
+            return httpx.Response(200, json=rows, headers={"X-Pagination-Page-Count": "1"})
         return None
 
     engine, store, clock, requests = await harness(trakt)
@@ -137,8 +123,7 @@ async def test_late_episode_backdated_updates_and_restart(harness):
     await worker.process(0)
     assert [r["episode"] for r in host.records.values()] == [1]
     assert next(iter(host.records.values()))["watched_at"] == "2020-01-01T11:00:00Z"
-    assert "/sync/history/shows/800" in [r.url.path for r in requests]
-    assert "/sync/history/episodes" not in [r.url.path for r in requests]
+    assert not any(r.url.path.startswith("/sync/history/") for r in requests)
 
     # A newly entered play can have a date earlier than every previous reconciliation.
     rows.append(episode(2, 2, "2019-01-01T11:00:00Z"))
@@ -146,15 +131,23 @@ async def test_late_episode_backdated_updates_and_restart(harness):
     requests.clear()
     await worker.process(0)
     assert [r["episode"] for r in host.records.values()] == [1, 2]
-    assert "/sync/history/episodes/102" in [r.url.path for r in requests]
+    assert "/sync/history/shows/800" in [r.url.path for r in requests]
     assert not any(r.method == "POST" for r in requests)
     assert host.units[3]["played"] is False
 
-    # A restart before advancing the final checkpoint never duplicates those facts.
-    state = await engine.get(0, "background_import")
-    state["full_due"] = 0
-    await engine.set(0, "background_import", state)
-    await BackgroundImport(engine, host).process(0)
+    # Restart and library checks never replay a completed Trakt record.
+    host.units[1].update(played=False, updated_at=iso_time(clock[0]))
+    requests.clear()
+    imports = host.calls["playback.sync.import"]
+    clock[0] += 8 * 86400
+    await engine.set(
+        0, "account", {**(await engine.get(0, "account")), "expires_at": clock[0] + 3600}
+    )
+    worker = BackgroundImport(engine, host)
+    await worker.process(0)
+    assert [r.url.path for r in requests] == ["/sync/last_activities"]
+    assert host.calls["playback.sync.import"] == imports
+    assert host.units[1]["played"] is False
     assert len(host.records) == 2
     assert (await engine.get(0, "background_import"))["imported"] == 2
     assert len(await store.scopes("task", entity="history")) == 0
@@ -188,7 +181,7 @@ async def test_conflict_backoff_local_unwatch_and_account_bound_opt_in(harness):
     await worker.process(2)
     assert not host.records
     retry = await engine.get(2, "background_import")
-    assert "stamp" not in retry and retry["retry_at"] > clock[0]
+    assert retry["stamp"]["episodes"] == stamp and retry["retry_at"] > clock[0]
     before = len(requests)
     await BackgroundImport(engine, host).process(2)
     assert len(requests) == before
@@ -212,7 +205,7 @@ async def test_scheduler_reacts_to_inventory_and_stops_on_cancel(harness):
     def trakt(request):
         if request.url.path == "/sync/last_activities":
             return httpx.Response(200, json={"movies": {"watched_at": "2026-01-01T00:00:00Z"}})
-        return httpx.Response(200, json={})
+        return httpx.Response(200, json=[])
 
     engine, _, _, _ = await harness(trakt)
     host = Host([])
@@ -343,7 +336,7 @@ async def test_catalog_removal_reconciles_surviving_previously_ambiguous_episode
     requests.clear()
     await worker.process(0)
     assert [r["episode"] for r in host.records.values()] == [1]
-    assert any(r.url.path == "/sync/history/episodes" for r in requests)
+    assert not any(r.url.path.startswith("/sync/history/") for r in requests)
 
 
 @pytest.mark.parametrize("lost_response", [False, True])
@@ -360,7 +353,9 @@ async def test_outbound_native_id_skips_cross_minute_echo_but_keeps_rewatch(harn
                 raise httpx.ReadError("fixture", request=request)
             return httpx.Response(201, json={"action": "scrobble", "id": 123})
         if request.url.path == "/sync/last_activities":
-            return httpx.Response(200, json={"episodes": {"watched_at": rewatch_at}})
+            return httpx.Response(
+                200, json={"episodes": {"watched_at": rewatch_at if len(rows) > 1 else echoed_at}}
+            )
         if request.url.path == "/sync/history/episodes":
             return httpx.Response(200, json=rows, headers={"X-Pagination-Page-Count": "1"})
         return None
@@ -389,7 +384,7 @@ async def test_outbound_native_id_skips_cross_minute_echo_but_keeps_rewatch(harn
     if lost_response:
         await worker.process(0)
         assert not host.records
-        assert "stamp" not in await engine.get(0, "background_import")
+        assert (await engine.get(0, "background_import"))["pending_retry"]
         clock[0] += 70
         await engine.drain(0)
     account = await engine.get(0, "account")
@@ -443,3 +438,43 @@ async def test_stale_binding_requires_new_consent_after_reconnection(harness):
     assert not (await preferences(engine, 0)).automatic_import
     await opt_in(engine, BackgroundImport(engine, Host([])))
     assert (await preferences(engine, 0)).automatic_import
+
+
+async def test_new_play_for_same_title_never_resends_old_source_after_local_reset(harness):
+    rows = [episode(1, 1, "2020-01-01T11:00:00Z")]
+    stamp = "2026-01-01T00:00:00Z"
+
+    def trakt(request):
+        if request.url.path == "/sync/last_activities":
+            return httpx.Response(200, json={"episodes": {"watched_at": stamp}})
+        if request.url.path == "/sync/watched/shows":
+            return httpx.Response(
+                200, json=[{"show": {"ids": {"trakt": 800}}, "last_updated_at": stamp}]
+            )
+        if request.url.path in {"/sync/history/episodes", "/sync/history/shows/800"}:
+            return httpx.Response(200, json=rows, headers={"X-Pagination-Page-Count": "1"})
+        return None
+
+    engine, _, clock, requests = await harness(trakt)
+    host = Host([local_episode(1), local_episode(2)])
+    worker = BackgroundImport(engine, host)
+    await opt_in(engine, worker)
+    await worker.process(0)
+    assert host.units[1]["played"]
+    # Simulate an undo and an absent host receipt. Only the plugin knows #1 is finished.
+    host.records.clear()
+    host.units[1].update(played=False, updated_at=iso_time(clock[0]))
+    rows.append(episode(2, 2, "2020-01-02T11:00:00Z"))
+    stamp = "2026-01-02T00:00:00Z"
+    requests.clear()
+    await BackgroundImport(engine, host).process(0)
+    assert [r["episode"] for r in host.records.values()] == [2]
+    assert not host.units[1]["played"]
+    assert "/sync/history/episodes" not in [r.url.path for r in requests]
+    assert "/sync/history/shows/800" in [r.url.path for r in requests]
+
+    rows.append(episode(3, 1, "2020-01-03T11:00:00Z"))
+    stamp = "2026-01-03T00:00:00Z"
+    await worker.process(0)
+    assert [r["episode"] for r in host.records.values()] == [2, 1]
+    assert host.units[1]["played"]

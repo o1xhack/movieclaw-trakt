@@ -8,14 +8,13 @@ from movieclaw_sdk.ops import OpsError
 
 from .activity import watch_activity
 from .client import TraktError
+from .import_records import ImportRecords
 from .policy import identity, iso_time, matches, timestamp, trakt_minute
 from .transfers import Transfers, digest, unit_key
 
 KINDS = ("movies", "episodes")
 POLL = 300
 CATALOG_CHECK = 1800
-FULL_CHECK = 7 * 86400
-TARGET_LIMIT = 12
 SNAPSHOT_PAGE = 400
 
 
@@ -82,12 +81,16 @@ class BackgroundImport:
         async with self.e.locks[member]:
             if await self.e.get(member, "automatic_import_binding"):
                 return
-            for name in [f"{side}_{kind}" for side in ("local", "remote") for kind in KINDS]:
+            for name in [
+                "inventory",
+                *(f"{side}_{kind}" for side in ("local", "remote") for kind in KINDS),
+            ]:
                 key = f"background_{name}"
                 meta = await self.e.get(member, key, {})
                 for i in range(meta.get("allocated", meta.get("pages", 0))):
                     await self.e.store.delete(f"{key}_{i}", scope=self.e.scope(member))
                 await self.e.store.delete(key, scope=self.e.scope(member))
+            await ImportRecords(self.e.store, member, "").clear()
             await self.e.store.delete("background_import", scope=self.e.scope(member))
             self.requested.discard(member)
             self.due.pop(member, None)
@@ -158,16 +161,6 @@ class BackgroundImport:
                 marks.append(timestamp(mark["at"]))
         if marks:
             return timestamp(when) <= max(marks)
-        if (
-            unit.get("watches")
-            and unit["updated_at"]
-            and not unit.get("last_played_at")
-            and not unit.get("position_ms")
-            and timestamp(unit["updated_at"]) >= timestamp(when)
-        ):
-            # The catalog retains historical facts after a local reset, including older resets
-            # from before this plugin recorded the event.
-            return True
         return False
 
     async def snapshot(self, member, name, generation):
@@ -244,87 +237,33 @@ class BackgroundImport:
                 return
             page += 1
 
-    async def target_paths(self, member, generation, kind, added, changed):
-        paths = {f"/sync/history/{kind}/{value}": None for value in changed}
-        titles = defaultdict(set)
-        for unit in added:
-            item = identity({"media": unit["media"], "unit": unit})
-            titles[tuple(sorted(external_ids(item).items()))].add(unit_key(unit))
-        if len(paths) + len(titles) > TARGET_LIMIT:
-            return {f"/sync/history/{kind}": None}
-        item_type = "movie" if kind == "movies" else "show"
-        for external, allowed in sorted(titles.items(), key=lambda pair: repr(pair[0])):
-            ids = dict(external)
-            for key in ("tmdb", "imdb"):
-                if key not in ids:
-                    continue
-                try:
-                    results = await self.fetch(
-                        member, generation, f"/search/{key}/{ids[key]}", {"type": item_type}
-                    )
-                except TraktError as exc:
-                    if exc.status not in {400, 404, 422}:
-                        raise
-                    continue
-                if not isinstance(results, list):
-                    raise TraktError(502)
-                ids_found = set()
-                for result in results:
-                    remote = result.get(item_type, {}).get("ids", {})
-                    if remote.get(key) == ids[key] and all(
-                        remote[k] == ids[k] for k in remote.keys() & ids.keys()
-                    ):
-                        trakt_id = remote.get("trakt")
-                        if type(trakt_id) is int and trakt_id > 0:
-                            ids_found.add(trakt_id)
-                if len(ids_found) == 1:
-                    path = f"/sync/history/{'movies' if kind == 'movies' else 'shows'}/{min(ids_found)}"
-                    if path not in paths:
-                        paths[path] = allowed
-                    elif paths[path] is not None:
-                        paths[path].update(allowed)
-                    break
-            else:
-                # Identity resolution can lag behind a valid history entry.
-                return {f"/sync/history/{kind}": None}
-        return paths
-
     async def watched_snapshot(self, member, generation, kind):
+        # Trakt exposes last_updated_at by title, independent of the viewing date.
+        item_type = "movie" if kind == "movies" else "show"
         try:
             rows = await self.fetch(
-                member, generation, f"/sync/watched/{kind}", {"extended": "min"}
+                member,
+                generation,
+                f"/sync/watched/{item_type}s",
+                {"extended": "noseasons"} if item_type == "show" else None,
             )
         except TraktError as exc:
             if exc.status in {400, 404, 422}:
                 return None
             raise
-        # Older/changed API shapes still reconcile through the canonical history.
-        if not isinstance(rows, dict) or any(
-            not key.isascii()
-            or not key.isdigit()
-            or not isinstance(dates, list)
-            or any(not isinstance(date, str) for date in dates)
-            for key, dates in rows.items()
-        ):
+        if not isinstance(rows, list):
             return None
-        return {key: digest(sorted(dates))[:32] for key, dates in rows.items() if dates}
-
-    async def histories(self, member, generation, kind, paths):
-        canonical = f"/sync/history/{kind}"
-        for path, allowed in sorted(paths.items()):
-            try:
-                async for row in self.history(member, generation, path):
-                    yield row, allowed
-            except TraktError as exc:
-                if path == canonical or exc.status not in {400, 404, 422}:
-                    raise
-                async for row in self.history(member, generation, canonical):
-                    yield row, None
-                return
+        result = {}
+        for row in rows:
+            trakt_id = row.get(item_type, {}).get("ids", {}).get("trakt")
+            updated = row.get("last_updated_at")
+            if type(trakt_id) is not int or trakt_id <= 0 or not isinstance(updated, str):
+                return None
+            result[str(trakt_id)] = updated
+        return result
 
     @staticmethod
-    def match(index, kind, row):
-        ids, season, episode = remote_unit(kind, row)
+    def match(index, kind, ids, season, episode):
         found = {}
         for key in match_keys(kind, ids, season, episode):
             for unit in index[key]:
@@ -333,10 +272,74 @@ class BackgroundImport:
                     found[unit_key(unit)] = unit
         return next(iter(found.values())) if len(found) == 1 else None
 
-    async def apply(self, member, generation, candidates):
+    async def fetch_history(self, member, generation, store, kind, targets):
+        canonical = f"/sync/history/{kind}"
+        pending = {}
+        try:
+            for target in sorted(targets or {""}):
+                title_kind = "movies" if kind == "movies" else "shows"
+                path = f"/sync/history/{title_kind}/{target}" if target else canonical
+                async for row in self.history(member, generation, path):
+                    record_id = row.get("id")
+                    if type(record_id) is not int or not 0 < record_id < 2**64:
+                        raise TraktError(502)
+                    if await store.done(record_id):
+                        continue
+                    when = row.get("watched_at")
+                    try:
+                        valid_time = datetime.fromisoformat(when.replace("Z", "+00:00"))
+                        if valid_time.tzinfo is None or len(when) > 40:
+                            raise ValueError
+                    except (ValueError, AttributeError):
+                        raise TraktError(502) from None
+                    ids, season, episode = remote_unit(kind, row)
+                    ids = {
+                        name: value
+                        for name, value in ids.items()
+                        if name in {"imdb", "tmdb"}
+                        and (
+                            (type(value) is int and 0 < value < 2**64)
+                            or (
+                                isinstance(value, str)
+                                and value.isascii()
+                                and value.isalnum()
+                                and len(value) <= 32
+                            )
+                        )
+                    }
+                    if not all(
+                        type(number) is int and 0 <= number <= 2**31 - 1
+                        for number in (season, episode)
+                    ):
+                        raise TraktError(502)
+                    item = row.get("movie" if kind == "movies" else "show", {})
+                    remote_id = item.get("ids", {}).get("trakt")
+                    if type(remote_id) is not int or not 0 < remote_id < 2**64:
+                        remote_id = None
+                    record = [
+                        kind,
+                        ids,
+                        season,
+                        episode,
+                        when,
+                        remote_id,
+                        "scrobble" if row.get("action") == "scrobble" else None,
+                    ]
+                    record_id = str(record_id)
+                    if record_id in pending and pending[record_id] != record:
+                        raise RetryScan("Trakt 返回了相互冲突的观看记录")
+                    pending[record_id] = record
+        except TraktError as exc:
+            if targets is None or exc.status not in {400, 404, 422}:
+                raise
+            return await self.fetch_history(member, generation, store, kind, None)
+        return pending, targets
+
+    async def apply(self, member, generation, records, candidates):
         applied = held = 0
         versions = {}
         conflict = False
+        finished = set()
         for start in range(0, len(candidates), 100):
             async with self.e.locks[member]:
                 account = await self.account(member, generation)
@@ -346,15 +349,14 @@ class BackgroundImport:
                     for job in (await self.e.ledger(member))["queue"]
                     if job["generation"] == generation and job.get("scrobble_window")
                 ]
-                batch, activity = [], []
+                batch, activity, done = [], [], set()
                 for unit, source_id, when, remote_id, action in candidates[start : start + 100]:
                     key = unit_key(unit)
                     if key in versions and versions[key] is False:
                         continue
                     item = identity({"media": unit["media"], "unit": unit})
-                    if (unit["played"] or unit["watches"]) and await self.e.outbound_scrobble(
-                        member, account, remote_id, item
-                    ):
+                    if await self.e.outbound_scrobble(member, account, remote_id, item):
+                        done.add(remote_id)
                         continue
                     if action == "scrobble" and any(
                         matches(item, pending["item"])
@@ -366,8 +368,16 @@ class BackgroundImport:
                         # Wait for the outbound receipt before advancing the import checkpoint.
                         conflict = True
                         continue
+                    if any(
+                        w["basis"] in {"playback", "state"}
+                        and trakt_minute(when) == trakt_minute(w["watched_at"])
+                        for w in unit["watches"]
+                    ):
+                        done.add(remote_id)
+                        continue
                     if await self.protected(member, owner, unit, item, when):
                         held += 1
+                        done.add(remote_id)
                         activity.append(
                             watch_activity(
                                 "held:" + source_id,
@@ -387,6 +397,7 @@ class BackgroundImport:
                         (
                             key,
                             media,
+                            remote_id,
                             {
                                 "media_item_id": media["id"],
                                 "kind": media["kind"],
@@ -402,15 +413,20 @@ class BackgroundImport:
                     )
                 if not batch:
                     await self.e.record_activities(member, activity, inbound=True)
+                    await records.finish(done)
+                    finished.update(done)
                     continue
                 result = await self.ops.call(
                     "playback.sync.import",
-                    {"member_id": member, "records": [row for _, _, row in batch]},
+                    {"member_id": member, "records": [row for _, _, _, row in batch]},
                 )
-                for (key, media, row), outcome in zip(batch, result["outcomes"], strict=True):
+                for (key, media, remote_id, row), outcome in zip(
+                    batch, result["outcomes"], strict=True
+                ):
                     status = outcome["status"]
                     if status == "applied":
                         applied += 1
+                        done.add(remote_id)
                         activity.append(
                             watch_activity(
                                 "import:" + row["source_id"],
@@ -425,7 +441,7 @@ class BackgroundImport:
                         if versions.get(key) is not False:
                             versions[key] = outcome["state_version"]
                     elif status == "already":
-                        continue
+                        done.add(remote_id)
                     elif status in {"conflict", "not_found"}:
                         versions[key] = False
                         conflict = True
@@ -433,117 +449,121 @@ class BackgroundImport:
                         # A source may already be anchored by the host to a different media row.
                         # Keep it and report the mismatch, avoiding an endless full-scan retry.
                         held += 1
+                        done.add(remote_id)
                         versions[key] = False
                 await self.e.record_activities(member, activity, inbound=True)
-        return applied, held, conflict
+                await records.finish(done)
+                finished.update(done)
+        return applied, held, conflict, finished
 
     async def reconcile(self, member, generation, state, inventory_due):
-        await self.verify_member(member)
+        owner = await self.verify_member(member)
         stamp = await self.activities(member, generation)
-        full = self.e.clock() >= state.get("full_due", 0)
+        initial = not state.get("record_ledger")
         previous_stamp = state.get("stamp", {})
-        changed = {kind for kind in KINDS if stamp[kind] != previous_stamp.get(kind)}
-        if not (inventory_due or full or changed):
+        changed = {kind for kind in KINDS if initial or stamp[kind] != previous_stamp.get(kind)}
+        if not (inventory_due or changed or state.get("attempt") or state.get("pending_retry")):
             return state
         async with self.e.locks[member]:
             await self.account(member, generation)
             namespace = await self.e.import_identity(member)
+        records = ImportRecords(self.e.store, member, digest([owner, namespace]))
         revision = self.library_revision
         units, index = await self.catalog(member)
-        snapshots = {}
-        candidates = {}
-        queried = False
-        for kind in KINDS:
-            inventory = {
-                key: digest(external_ids(identity({"media": u["media"], "unit": u})))[:32]
-                for key, u in units[kind].items()
-            }
-            before = await self.snapshot(member, f"local_{kind}", generation)
-            added = [
-                u for key, u in units[kind].items() if (before or {}).get(key) != inventory[key]
+        inventory = {
+            unit_key(unit): digest(external_ids(identity({"media": unit["media"], "unit": unit})))[
+                :32
             ]
-            if inventory != before:
-                snapshots[f"local_{kind}"] = (inventory, before)
-            remote = None
-            old_remote = None
-            if full or kind in changed:
+            for group in units.values()
+            for unit in group.values()
+        }
+        previous_inventory = await self.snapshot(member, "inventory", generation)
+        inventory_changed = inventory != previous_inventory
+        if changed or inventory_changed or state.get("attempt") or state.get("pending_retry"):
+            before = await records.pending()
+            pending = dict(before)
+            snapshots = {}
+            changed_records = set()
+            for kind in sorted(changed):
                 remote = await self.watched_snapshot(member, generation, kind)
-                old_remote = await self.snapshot(member, f"remote_{kind}", generation)
-                if remote is not None and remote != old_remote:
-                    snapshots[f"remote_{kind}"] = (remote, old_remote)
-            if not inventory:
-                continue
-            if (
-                full
-                or before is None
-                # A removed or reidentified item can leave a formerly ambiguous
-                # match with exactly one surviving target.
-                or any(inventory.get(key) != value for key, value in before.items())
-                or (kind in changed and (remote is None or old_remote is None))
-            ):
-                paths = {f"/sync/history/{kind}": None}
-            else:
-                delta = [
-                    key for key, h in (remote or {}).items() if h != (old_remote or {}).get(key)
-                ]
-                # A change stamp with no visible delta can include same-date replacements.
-                paths = (
-                    {f"/sync/history/{kind}": None}
-                    if kind in changed and remote == old_remote
-                    else await self.target_paths(member, generation, kind, added, delta)
-                )
-            native = {}
-            queried |= bool(paths)
-            async for row, allowed in self.histories(member, generation, kind, paths):
-                unit = self.match(index, kind, row)
-                if unit is None or (allowed is not None and unit_key(unit) not in allowed):
-                    continue
-                when, remote_id = row.get("watched_at"), row.get("id")
-                try:
-                    valid_time = datetime.fromisoformat(when.replace("Z", "+00:00"))
-                    if valid_time.tzinfo is None:
-                        raise ValueError
-                except (ValueError, AttributeError):
-                    raise TraktError(502) from None
-                if type(remote_id) is not int or remote_id <= 0:
-                    raise TraktError(502)
-                if valid_time.timestamp() > self.e.clock():
-                    raise RetryScan("Trakt 观看时间尚未到达，稍后核对")
-                key = unit_key(unit)
-                if key not in native:
-                    native[key] = {
-                        trakt_minute(w["watched_at"])
-                        for w in unit["watches"]
-                        if w["basis"] in {"playback", "state"}
+                previous = await self.snapshot(member, f"remote_{kind}", generation)
+                if remote is not None:
+                    snapshots[kind] = (remote, previous)
+                targets = None
+                if not initial and remote is not None and previous is not None:
+                    delta = {
+                        key
+                        for key in remote.keys() | previous.keys()
+                        if remote.get(key) != previous.get(key)
                     }
-                if trakt_minute(when) in native[key]:
+                    if delta:
+                        targets = delta
+                # A changed activity stamp without a usable delta can be a same-date
+                # replacement or a server without the minimal watched snapshot.
+                if initial and not remote and not stamp[kind]:
                     continue
-                source = digest([namespace, remote_id])
-                fact = (unit, source, when, remote_id, row.get("action"))
-                if source in candidates and candidates[source] != fact:
-                    raise RetryScan("Trakt 返回了相互冲突的观看记录")
-                candidates[source] = fact
-        if (queried or changed) and await self.activities(member, generation) != stamp:
-            raise RetryScan("Trakt 历史在扫描期间更新，稍后重新核对")
-        # Newer records are evaluated first so a local unwatch cutoff is handled consistently.
-        ordered = sorted(candidates.values(), key=lambda fact: timestamp(fact[2]), reverse=True)
-        applied, held, conflict = await self.apply(member, generation, ordered)
-        state["imported"] = state.get("imported", 0) + applied
-        if applied:
-            state["last_imported"] = iso_time(self.e.clock())
-        state["protected"] = held
-        if conflict:
-            raise RetryScan("媒体库或观看状态在同步期间更新，稍后重新核对")
-        # Only publish indexes after the host has accepted the writes. Replaying after a restart
-        # uses the identical source IDs, even if indexes or the final stamp weren't saved.
-        for name, (snapshot, previous) in snapshots.items():
+                if initial and not remote and stamp[kind] == "1970-01-01T00:00:00Z":
+                    continue
+                found, targets = await self.fetch_history(
+                    member, generation, records, kind, targets
+                )
+                pending = {
+                    key: row
+                    for key, row in pending.items()
+                    if row[0] != kind or (targets is not None and str(row[5]) not in targets)
+                }
+                changed_records.update(found)
+                pending.update(found)
+            if changed and await self.activities(member, generation) != stamp:
+                raise RetryScan("Trakt 历史在扫描期间更新，稍后重新核对")
+            candidates = []
+            reconsider = (
+                pending.keys()
+                if (inventory_changed or state.get("pending_retry") or state.get("attempt"))
+                else changed_records
+            )
+            for record_id in tuple(reconsider):
+                kind, ids, season, episode, when, _, action = pending[record_id]
+                if await records.done(record_id):
+                    del pending[record_id]
+                    continue
+                unit = self.match(index, kind, ids, season, episode)
+                if unit:
+                    candidates.append(
+                        (unit, digest([namespace, int(record_id)]), when, int(record_id), action)
+                    )
+            candidates.sort(key=lambda fact: timestamp(fact[2]), reverse=True)
+            if any(timestamp(fact[2]) > self.e.clock() for fact in candidates):
+                raise RetryScan("Trakt 观看时间尚未到达，稍后核对")
             async with self.e.locks[member]:
                 await self.account(member, generation)
-                await self.save_snapshot(member, name, generation, snapshot, previous)
+                await self.verify_member(member)
+                await records.save_pending(before, pending)
+                for kind, (remote, previous) in snapshots.items():
+                    await self.save_snapshot(member, f"remote_{kind}", generation, remote, previous)
+                if inventory_changed:
+                    await self.save_snapshot(
+                        member, "inventory", generation, inventory, previous_inventory
+                    )
+                # Incoming records and the checkpoint become durable before any remote write.
+                state.update(stamp=stamp, record_ledger=True, pending_retry=True)
+                await self.e.set(member, "background_import", state)
+            applied, held, conflict, finished = await self.apply(
+                member, generation, records, candidates
+            )
+            remaining = {key: row for key, row in pending.items() if int(key) not in finished}
+            async with self.e.locks[member]:
+                await self.account(member, generation)
+                await records.save_pending(pending, remaining)
+            state["imported"] = state.get("imported", 0) + applied
+            state["protected"] = state.get("protected", 0) + held
+            if applied:
+                state["last_imported"] = iso_time(self.e.clock())
+            if conflict:
+                raise RetryScan("媒体库或观看状态在同步期间更新，稍后重新核对")
+            state["pending_retry"] = False
         self.catalog_revision[member] = revision
-        state.update(stamp=stamp, catalog_due=self.e.clock() + CATALOG_CHECK)
-        if full:
-            state["full_due"] = self.e.clock() + FULL_CHECK
+        state["catalog_due"] = self.e.clock() + CATALOG_CHECK
         return state
 
     async def activities(self, member, generation):

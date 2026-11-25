@@ -132,7 +132,9 @@ async def test_lost_stop_response_checks_history_before_retry(harness, event):
             raise httpx.ReadError("response lost", request=request)
         if request.url.path.startswith("/sync/history/"):
             return httpx.Response(
-                200, json=[{"watched_at": iso_time(clock[0] - 60), "movie": {"ids": {"tmdb": 11}}}]
+                200,
+                headers={"X-Pagination-Page-Count": "1"},
+                json=[{"watched_at": iso_time(clock[0] - 60), "movie": {"ids": {"tmdb": 11}}}],
             )
 
     e, _, clock, requests = await harness(handler)
@@ -283,7 +285,9 @@ async def test_process_exit_after_remote_success_never_blindly_resends(harness, 
             raise RuntimeError("fixture process exit after remote commit")
         if request.url.path == "/sync/history/movies":
             return httpx.Response(
-                200, json=[{"movie": {"ids": {"tmdb": 11}}, "watched_at": iso_time(clock[0])}]
+                200,
+                headers={"X-Pagination-Page-Count": "1"},
+                json=[{"movie": {"ids": {"tmdb": 11}}, "watched_at": iso_time(clock[0])}],
             )
 
     e, store, clock, requests = await harness(handler)
@@ -492,3 +496,93 @@ async def test_local_rewatches_are_distinct_and_each_replay_is_idempotent(harnes
     clock[0] += 1
     await e.drain(0)
     assert [r.url.path for r in requests].count("/sync/history") == 2
+
+
+async def test_watching_times_out_when_position_stops_moving_and_survives_restart(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": "scrobble",
+                    "started_at": started,
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return httpx.Response(201, json={"action": "pause"})
+
+    engine, store, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
+    await engine.accept("started", {**event, "position_ms": 0}, "start", started)
+    await engine.drain(0)
+    clock[0] += 120
+    await engine.accept("progress", event, "advanced", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 120
+    await engine.accept("progress", event, "stationary", iso_time(clock[0]))
+    assert [r.url.path for r in requests] == ["/scrobble/start"]
+    restarted = Engine(store, engine.client, engine.health, engine.log, clock=engine.clock)
+    await restarted.drain(0)
+    assert len(requests) == 1
+    clock[0] += 30
+    await restarted.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+    assert json.loads(requests[-1].content)["progress"] == 90
+    assert await store.get("delivery", scope="member:0") is None
+
+    # Progress that genuinely advances again can resume after idle cleanup.
+    clock[0] += 30
+    await restarted.accept(
+        "progress", {**event, "position_ms": 95000}, "resume", iso_time(clock[0])
+    )
+    await restarted.drain(0)
+    assert requests[-1].url.path == "/scrobble/start"
+
+
+@pytest.mark.parametrize("action, offset", [("checkin", 0), ("scrobble", 30)])
+async def test_idle_cleanup_does_not_clear_manually_started_or_newer_watching(
+    harness, event, action, offset
+):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": action,
+                    "started_at": iso_time(started + offset),
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return httpx.Response(201, json={"action": "start"})
+
+    engine, _, clock, requests = await harness(handler)
+    started = clock[0]
+    await engine.accept("started", event, "start", iso_time(started))
+    await engine.drain(0)
+    clock[0] += 150
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/start", "/users/me/watching"]
+
+
+async def test_stop_without_duration_runs_watching_cleanup_immediately(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(200, json={"started_at": started, "movie": {"ids": {"tmdb": 11}}})
+        return httpx.Response(201, json={})
+
+    engine, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
+    await engine.accept("started", event, "start", started)
+    await engine.drain(0)
+    clock[0] += 10
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
