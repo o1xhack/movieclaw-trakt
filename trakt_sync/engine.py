@@ -1084,7 +1084,8 @@ class Engine(ActivityLog, Recovery):
                 await clear_rejected()
             raise
         live = ledger.pop("unconfirmed_start")
-        live["window_end"] = self.clock() + 1
+        live["ack_at"] = self.clock()
+        live["window_end"] = live["ack_at"] + 1
         ledger["live_watching"] = live
         return result
 
@@ -1105,7 +1106,10 @@ class Engine(ActivityLog, Recovery):
             started_at = timestamp(started)
         except (AttributeError, TypeError, ValueError):
             return
-        if int(live["sent_at"]) <= started_at <= min(end, stopped_at):
+        acknowledged = live.get("ack_at", stopped_at)
+        if live["sent_at"] <= stopped_at and int(live["sent_at"]) <= started_at <= min(
+            end, max(stopped_at, acknowledged)
+        ):
             await self.authorized(
                 member,
                 account,
@@ -1117,7 +1121,13 @@ class Engine(ActivityLog, Recovery):
     async def retry_watching_cleanup(self, member, account, ledger, cleanup):
         live = cleanup["live"]
         pending = ledger["watching_cleanups"]
-        if self.clock() > cleanup["expires_at"]:
+        current = ledger.get("live_watching")
+        superseded = (
+            current
+            and current["sent_at"] > live["sent_at"]
+            and matches(live["item"], current["item"])
+        )
+        if superseded or self.clock() > cleanup["expires_at"]:
             pending.pop(live["key"], None)
         else:
             try:

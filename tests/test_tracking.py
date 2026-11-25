@@ -838,8 +838,37 @@ async def test_legacy_watching_without_recorded_bounds_is_not_cleared(harness, e
     await engine.drain(0)
     ledger = await engine.ledger(0)
     ledger["live_watching"].pop("window_end")
+    ledger["live_watching"].pop("ack_at")
     await engine.save_ledger(0, ledger)
     clock[0] += 5
     await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
     await engine.drain(0)
     assert [r.url.path for r in requests] == ["/scrobble/start"]
+
+
+async def test_stop_clears_a_start_committed_in_flight_after_the_player_stopped(harness, event):
+    def handler(request):
+        if request.url.path == "/scrobble/start":
+            clock[0] += 10
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": "scrobble",
+                    "started_at": iso_time(started + 8),
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    started = clock[0]
+    await engine.accept("started", event, "start", iso_time(started))
+    await engine.drain(0)
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(started + 5))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
