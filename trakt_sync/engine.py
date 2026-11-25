@@ -304,7 +304,7 @@ class Engine(ActivityLog, Recovery):
             if queue
             else [j["retry_at"] for j in ledger.get("failed", []) if "retry_at" in j]
         )
-        if cleanup := ledger.get("watching_cleanup"):
+        for cleanup in ledger.get("watching_cleanups", {}).values():
             deadlines.append(cleanup["next_at"])
         if deadlines:
             await self.set(
@@ -322,7 +322,7 @@ class Engine(ActivityLog, Recovery):
         await self.set(member, "account", {**current, "blocked": True}, secret=True)
         ledger.pop("live_watching", None)
         ledger.pop("unconfirmed_start", None)
-        ledger.pop("watching_cleanup", None)
+        ledger.pop("watching_cleanups", None)
         ledger.update(
             queue=[],
             failed=[],
@@ -1088,7 +1088,7 @@ class Engine(ActivityLog, Recovery):
         ledger["live_watching"] = live
         return result
 
-    async def pause_owned_watching(self, member, account, live):
+    async def pause_owned_watching(self, member, account, live, stopped_at):
         end = live.get("window_end")
         if end is None:
             acknowledged = live.get("ack_at")
@@ -1105,7 +1105,7 @@ class Engine(ActivityLog, Recovery):
             started_at = timestamp(started)
         except (AttributeError, TypeError, ValueError):
             return
-        if int(live["sent_at"]) <= started_at <= end:
+        if int(live["sent_at"]) <= started_at <= min(end, stopped_at):
             await self.authorized(
                 member,
                 account,
@@ -1115,26 +1115,33 @@ class Engine(ActivityLog, Recovery):
             )
 
     async def retry_watching_cleanup(self, member, account, ledger, cleanup):
-        live = self.watching_for(ledger, cleanup["key"])
-        now = self.clock()
-        if not live or live["sent_at"] != cleanup["sent_at"] or now > cleanup["expires_at"]:
-            ledger.pop("watching_cleanup", None)
+        live = cleanup["live"]
+        pending = ledger["watching_cleanups"]
+        if self.clock() > cleanup["expires_at"]:
+            pending.pop(live["key"], None)
         else:
             try:
-                await self.pause_owned_watching(member, account, {**live, "progress": 100})
+                await self.pause_owned_watching(
+                    member, account, {**live, "progress": 100}, cleanup["stopped_at"]
+                )
             except TraktError as exc:
                 if exc.auth_error:
                     await self.block_auth(member, account, ledger)
                     return
-                cleanup["next_at"] = now + max(60, exc.retry_after)
+                cleanup["next_at"] = self.clock() + max(60, exc.retry_after)
                 if exc.status == 429:
                     ledger["requests_not_before"] = cleanup["next_at"]
             else:
-                ledger.pop("watching_cleanup", None)
-                for marker in ("live_watching", "unconfirmed_start"):
-                    if ledger.get(marker, {}).get("key") == cleanup["key"]:
-                        ledger.pop(marker)
+                pending.pop(live["key"], None)
+                self.clear_watching_markers(ledger, live["key"], live["sent_at"])
         await self.save_ledger(member, ledger)
+
+    @staticmethod
+    def clear_watching_markers(ledger, key, sent_at=None):
+        for marker in ("live_watching", "unconfirmed_start"):
+            live = ledger.get(marker, {})
+            if live.get("key") == key and (sent_at is None or live["sent_at"] == sent_at):
+                ledger.pop(marker)
 
     async def drain(self, member):
         async with self.locks[member]:
@@ -1151,7 +1158,11 @@ class Engine(ActivityLog, Recovery):
             ledger = await self.ledger(member)
             if self.clock() < ledger.get("requests_not_before", 0):
                 return
-            cleanup = ledger.get("watching_cleanup")
+            cleanup = min(
+                ledger.get("watching_cleanups", {}).values(),
+                key=lambda record: record["next_at"],
+                default=None,
+            )
             if (
                 cleanup
                 and cleanup["next_at"] <= self.clock()
@@ -1243,21 +1254,23 @@ class Engine(ActivityLog, Recovery):
                             if job.get("clear_watching") and not late and live:
                                 try:
                                     await self.pause_owned_watching(
-                                        member, account, {**live, "progress": 100}
+                                        member,
+                                        account,
+                                        {**live, "progress": 100},
+                                        timestamp(job["occurred_at"]),
                                     )
                                 except TraktError as exc:
                                     if exc.auth_error or exc.status == 429:
                                         raise
-                                    ledger["watching_cleanup"] = {
-                                        "key": job["key"],
-                                        "sent_at": live["sent_at"],
+                                    pending_cleanup = ledger.setdefault("watching_cleanups", {})
+                                    pending_cleanup[job["key"]] = {
+                                        "live": live,
+                                        "stopped_at": timestamp(job["occurred_at"]),
                                         "next_at": self.clock() + max(60, exc.retry_after),
                                         "expires_at": self.clock() + 300,
                                     }
                                 else:
-                                    for marker in ("live_watching", "unconfirmed_start"):
-                                        if ledger.get(marker, {}).get("key") == job["key"]:
-                                            ledger.pop(marker)
+                                    self.clear_watching_markers(ledger, job["key"])
                             # Persist the change of write contract before POST. If this
                             # response is lost too, reconcile its explicit source minute.
                             job.pop("scrobble_window", None)
@@ -1281,7 +1294,10 @@ class Engine(ActivityLog, Recovery):
                         live = self.watching_for(ledger, job["key"])
                         if live:
                             await self.pause_owned_watching(
-                                member, account, {**live, "progress": job["body"]["progress"]}
+                                member,
+                                account,
+                                {**live, "progress": job["body"]["progress"]},
+                                timestamp(job["occurred_at"]),
                             )
                         result = {"action": "pause"}
                     else:
@@ -1386,9 +1402,7 @@ class Engine(ActivityLog, Recovery):
             if job["path"] in {"/scrobble/stop", "/scrobble/pause"} and result.get(
                 "action"
             ) not in {"expired", "manual_unwatched", "local_deleted"}:
-                for marker in ("live_watching", "unconfirmed_start"):
-                    if ledger.get(marker, {}).get("key") == job["key"]:
-                        ledger.pop(marker)
+                self.clear_watching_markers(ledger, job["key"])
             if result.get("action") not in {"expired", "manual_unwatched"}:
                 ledger["last_success"] = iso_time(self.clock())
             ledger["last_error"] = (

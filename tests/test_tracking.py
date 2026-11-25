@@ -781,7 +781,10 @@ async def test_slow_watching_lookup_never_sends_an_expired_start(harness, event)
     assert [r.url.path for r in requests] == ["/users/me/watching"]
 
 
-async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(harness, event):
+@pytest.mark.parametrize("new_start", [False, True])
+async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(
+    harness, event, new_start
+):
     lookups = 0
 
     def handler(request):
@@ -794,7 +797,11 @@ async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(harne
                 return httpx.Response(503)
             return httpx.Response(
                 200,
-                json={"action": "scrobble", "started_at": started, "movie": {"ids": {"tmdb": 11}}},
+                json={
+                    "action": "scrobble",
+                    "started_at": iso_time(started + (10 if new_start else 0)),
+                    "movie": {"ids": {"tmdb": 11}},
+                },
             )
         if request.method == "GET" and request.url.path == "/sync/history/movies":
             return httpx.Response(200, json=[])
@@ -802,8 +809,8 @@ async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(harne
 
     engine, store, clock, requests = await harness(handler)
     payload = {**event, "viewing_id": "same-session"}
-    started = iso_time(clock[0])
-    await engine.accept("started", payload, "start", started)
+    started = clock[0]
+    await engine.accept("started", payload, "start", iso_time(started))
     await engine.drain(0)
     clock[0] += 5
     await engine.accept("completed", payload, "stop", iso_time(clock[0]))
@@ -817,7 +824,11 @@ async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(harne
     assert (await store.get("delivery", scope="member:0"))["next_at"] == clock[0] + 60
     clock[0] += 60
     await engine.drain(0)
-    assert [r.url.path for r in requests[-2:]] == ["/users/me/watching", "/scrobble/pause"]
+    if new_start:
+        assert requests[-1].url.path == "/users/me/watching"
+        assert not any(r.url.path == "/scrobble/pause" for r in requests)
+    else:
+        assert [r.url.path for r in requests[-2:]] == ["/users/me/watching", "/scrobble/pause"]
     assert await store.get("delivery", scope="member:0") is None
 
 
