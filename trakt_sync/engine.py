@@ -264,6 +264,10 @@ class Engine(ActivityLog, Recovery):
             for j in queue
             if self.finished(j) or self.clock() - timestamp(j["occurred_at"]) <= 300
         ]
+        queued = {job["id"] for job in queue}
+        for playback in ledger["sessions"].values():
+            if playback.get("inferred_start") not in queued:
+                playback.pop("inferred_start", None)
         ledger["seen"] = ledger["seen"][-256:]
         ledger["sessions"] = dict(list(ledger["sessions"].items())[-16:])
         if ledger.get("last_error"):
@@ -730,10 +734,16 @@ class Engine(ActivityLog, Recovery):
                     position = event["position_ms"]
                     elapsed = at - state.get("sample_at", at)
                     traveled = position - state.get("sample_position", position)
-                    state.update(at=at, sample_at=at, sample_position=position)
+                    if elapsed < 0:
+                        return
+                    state.update(sample_at=at, sample_position=position)
                     if live.get("key") == key:
                         live["progress"] = rate
-                    elif not state.get("session") or state.get("closed"):
+                    elif (
+                        (not state.get("session") or state.get("closed"))
+                        and not state.get("inferred_start")
+                        and at >= state.get("retry_inferred_at", 0)
+                    ):
                         # A seek can move the position without playback. Require two
                         # consecutive advances at a plausible rate before inferring a start.
                         moving = 5 <= elapsed <= 150 and 250 * elapsed <= traveled <= 4000 * elapsed
@@ -741,10 +751,11 @@ class Engine(ActivityLog, Recovery):
                             state.get("moving_reports", 0) + 1 if moving else 0
                         )
                         if state["moving_reports"] >= 2:
-                            state = {"session": event_id, "at": at}
+                            state["inferred_start"] = event_id
                             request = {
                                 "path": "/scrobble/start",
                                 "body": {**item, "progress": rate},
+                                "inferred": True,
                             }
                 elif not state.get("closed") or (completed and "terminal_at" not in state):
                     state["at"] = at
@@ -768,6 +779,7 @@ class Engine(ActivityLog, Recovery):
                                 "body": {**item, "progress": live["progress"]},
                             }
             if item and kind in {"stopped", "completed"} and at >= state.get("at", 0):
+                state.pop("inferred_start", None)
                 ledger["queue"] = [
                     job
                     for job in ledger["queue"]
@@ -803,7 +815,10 @@ class Engine(ActivityLog, Recovery):
             ledger["sessions"] = dict(
                 sorted(
                     ledger["sessions"].items(),
-                    key=lambda pair: pair[1].get("at", pair[1].get("terminal_at", 0)),
+                    key=lambda pair: max(
+                        pair[1].get("at", pair[1].get("terminal_at", 0)),
+                        pair[1].get("sample_at", 0),
+                    ),
                 )[-16:]
             )
             ledger["seen"] = [*ledger["seen"], event_id][-256:]
@@ -962,6 +977,26 @@ class Engine(ActivityLog, Recovery):
         finally:
             if window := job.get("scrobble_window"):
                 window["end"] = iso_time(max(timestamp(window["start"]), self.clock()))
+
+    async def deliver_start(self, member, account, ledger, job):
+        if not job.get("inferred"):
+            return await self.start_watching(member, account, ledger, job)
+        state = ledger["sessions"].get(job["key"], {})
+        if state.get("inferred_start") != job["id"]:
+            return {"action": "expired"}
+        current = await self.authorized(member, account, "GET", "/users/me/watching")
+        if current:
+            # A known start can replace watching; an inferred start must not.
+            state.pop("inferred_start", None)
+            state["moving_reports"] = 0
+            state["retry_inferred_at"] = self.clock() + 60
+            return {"action": "expired"}
+        result = await self.start_watching(member, account, ledger, job)
+        ledger["sessions"][job["key"]] = {
+            "session": job["id"],
+            "at": timestamp(job["occurred_at"]),
+        }
+        return result
 
     async def start_watching(self, member, account, ledger, job):
         previous = ledger.get("live_watching")
@@ -1142,7 +1177,7 @@ class Engine(ActivityLog, Recovery):
                     elif finished and job["path"] == "/scrobble/stop":
                         result = await self.native_stop(member, account, ledger, job)
                     elif job["path"] == "/scrobble/start":
-                        result = await self.start_watching(member, account, ledger, job)
+                        result = await self.deliver_start(member, account, ledger, job)
                     elif job["path"] == "/scrobble/pause":
                         live = ledger.get("live_watching", {})
                         if live.get("key") == job["key"]:

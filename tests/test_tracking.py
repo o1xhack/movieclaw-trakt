@@ -575,7 +575,9 @@ async def test_stop_without_duration_does_not_pause_a_different_trakt_session(
 
 
 async def test_movement_without_an_initial_start_opens_a_single_scrobble(harness, event):
-    engine, _, clock, requests = await harness()
+    engine, _, clock, requests = await harness(
+        lambda r: httpx.Response(204) if r.url.path == "/users/me/watching" else None
+    )
     for offset, position in enumerate((10_000, 10_000, 20_000, 30_000)):
         clock[0] += 30
         await engine.accept(
@@ -584,8 +586,8 @@ async def test_movement_without_an_initial_start_opens_a_single_scrobble(harness
         await engine.drain(0)
         if offset < 3:
             assert not requests
-    assert [r.url.path for r in requests] == ["/scrobble/start"]
-    assert json.loads(requests[0].content)["progress"] == 30
+    assert [r.url.path for r in requests if r.method == "POST"] == ["/scrobble/start"]
+    assert json.loads(requests[-1].content)["progress"] == 30
 
 
 async def test_seek_only_does_not_infer_a_playback_start(harness, event):
@@ -603,7 +605,9 @@ async def test_seek_only_does_not_infer_a_playback_start(harness, event):
 async def test_missing_start_recovers_after_an_abandoned_title_or_same_title_stop(
     harness, event, prior_stop
 ):
-    engine, _, clock, requests = await harness()
+    engine, _, clock, requests = await harness(
+        lambda r: httpx.Response(204) if r.url.path == "/users/me/watching" else None
+    )
     await engine.accept("started", event, "old-start", iso_time(clock[0]))
     await engine.drain(0)
     if prior_stop:
@@ -620,8 +624,35 @@ async def test_missing_start_recovers_after_an_abandoned_title_or_same_title_sto
             "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
         )
         await engine.drain(0)
-    assert [r.url.path for r in requests] == (
+    assert [r.url.path for r in requests if r.method == "POST"] == (
         ["/scrobble/start", "/scrobble/stop", "/scrobble/start"]
         if prior_stop
         else ["/scrobble/start", "/scrobble/start"]
     )
+
+
+async def test_durable_start_can_arrive_after_progress_following_a_stop(harness, event):
+    engine, _, clock, requests = await harness()
+    await engine.accept("stopped", {**event, "position_ms": 20000}, "old-stop", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 60
+    await engine.accept("progress", {**event, "position_ms": 30000}, "progress", iso_time(clock[0]))
+    await engine.accept("started", event, "delayed-start", iso_time(clock[0] - 20))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/stop", "/scrobble/start"]
+
+
+async def test_inferred_start_does_not_replace_currently_watching_on_another_device(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(200, json={"action": "scrobble", "movie": {"ids": {"tmdb": 22}}})
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching"]
