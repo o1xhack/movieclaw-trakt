@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from movieclaw_sdk.ops import OpsError
@@ -112,23 +113,27 @@ class BackgroundImport:
             raise Superseded
         return account
 
-    async def member_identity(self, member):
+    async def member_stamp(self, member):
         if member == 0:
-            return "admin"
+            return "admin", None
         profile = await self.ops.call("members.show", {"member_id": member})
         if profile.get("id") != member or profile.get("status") != "active":
             raise RetryScan("MovieClaw 成员当前不可用")
         created = profile.get("created_at")
         if not isinstance(created, str) or not created:
             raise RetryScan("无法确认 MovieClaw 成员身份")
-        return digest([member, created])
+        return digest([member, created]), created
+
+    async def member_identity(self, member):
+        owner, _ = await self.member_stamp(member)
+        return owner
 
     async def verify_member(self, member):
         binding = await self.e.get(member, "automatic_import_binding", {})
-        owner = await self.member_identity(member)
+        owner, created = await self.member_stamp(member)
         if owner != binding.get("member"):
             raise RetryScan("MovieClaw 成员已更换，请关闭后台导入并核对 Trakt 绑定")
-        return owner
+        return owner, created
 
     async def fetch(self, member, generation, path, params=None):
         # OAuth rotation is shared with outgoing delivery. Release the lock between requests.
@@ -294,20 +299,7 @@ class BackgroundImport:
                     except (ValueError, AttributeError):
                         raise TraktError(502) from None
                     ids, season, episode = remote_unit(kind, row)
-                    ids = {
-                        name: value
-                        for name, value in ids.items()
-                        if name in {"imdb", "tmdb"}
-                        and (
-                            (type(value) is int and 0 < value < 2**64)
-                            or (
-                                isinstance(value, str)
-                                and value.isascii()
-                                and value.isalnum()
-                                and len(value) <= 32
-                            )
-                        )
-                    }
+                    ids = self.catalog_ids(ids)
                     if not all(
                         type(number) is int and 0 <= number <= 2**31 - 1
                         for number in (season, episode)
@@ -341,17 +333,17 @@ class BackgroundImport:
         versions = {}
         conflict = False
         finished = set()
-        for start in range(0, len(candidates), 100):
+        for start in range(0, len(candidates), 32):
             async with self.e.locks[member]:
                 account = await self.account(member, generation)
-                owner = await self.verify_member(member)
+                owner, member_created_at = await self.verify_member(member)
                 pending_scrobbles = [
                     job["scrobble_window"]
                     for job in (await self.e.ledger(member))["queue"]
                     if job["generation"] == generation and job.get("scrobble_window")
                 ]
                 batch, activity, done = [], [], set()
-                for unit, source_id, when, remote_id, action in candidates[start : start + 100]:
+                for unit, source_id, when, remote_id, action in candidates[start : start + 32]:
                     key = unit_key(unit)
                     if key in versions and versions[key] is False:
                         continue
@@ -417,10 +409,17 @@ class BackgroundImport:
                     await records.finish(done)
                     finished.update(done)
                     continue
-                result = await self.ops.call(
-                    "playback.sync.import",
-                    {"member_id": member, "records": [row for _, _, _, row in batch]},
-                )
+                payload = {"member_id": member, "records": [row for _, _, _, row in batch]}
+                if member_created_at:
+                    payload["expected_member_created_at"] = member_created_at
+                try:
+                    result = await self.ops.call("playback.sync.import", payload)
+                except OpsError as exc:
+                    if member_created_at and exc.code == "INVALID_ARGUMENTS":
+                        raise RetryScan(
+                            "MovieClaw 服务端版本暂不支持成员后台导入，请升级服务端"
+                        ) from exc
+                    raise
                 for (key, media, remote_id, row), outcome in zip(
                     batch, result["outcomes"], strict=True
                 ):
@@ -457,13 +456,64 @@ class BackgroundImport:
                 finished.update(done)
         return applied, held, conflict, finished
 
-    async def reconcile(self, member, generation, state, inventory_due):
-        owner = await self.verify_member(member)
+    async def refresh_pending(self, member, generation, pending, index, after):
+        unresolved = defaultdict(list)
+        for record_id, row in pending.items():
+            kind, ids, season, episode, _, remote_id, _ = row
+            if remote_id is not None and not self.match(index, kind, ids, season, episode):
+                title = ("movies" if kind == "movies" else "shows", remote_id)
+                unresolved[f"{title[0]}/{title[1]}"].append(record_id)
+        titles = sorted(title for title in unresolved if title > after)
+        changed = set()
+        for title in titles[:TARGET_LIMIT]:
+            try:
+                metadata = await self.fetch(member, generation, f"/{title}")
+            except TraktError as exc:
+                if exc.status == 404:
+                    continue
+                raise
+            ids = self.catalog_ids(metadata.get("ids", {})) if isinstance(metadata, dict) else {}
+            if not ids:
+                continue
+            for record_id in unresolved[title]:
+                row = pending[record_id]
+                if row[1] != ids:
+                    pending[record_id] = [row[0], ids, *row[2:]]
+                    changed.add(record_id)
+        return changed, titles[TARGET_LIMIT - 1] if len(titles) > TARGET_LIMIT else None
+
+    @staticmethod
+    def catalog_ids(ids):
+        if not isinstance(ids, dict):
+            return {}
+        return {
+            name: value
+            for name, value in ids.items()
+            if name in {"imdb", "tmdb"}
+            and (
+                (type(value) is int and 0 < value < 2**64)
+                or (
+                    isinstance(value, str)
+                    and value.isascii()
+                    and value.isalnum()
+                    and len(value) <= 32
+                )
+            )
+        }
+
+    async def reconcile(self, member, generation, state, inventory_due, *, requested=False):
+        owner, _ = await self.verify_member(member)
         stamp = await self.activities(member, generation)
         initial = not state.get("record_ledger")
         previous_stamp = state.get("stamp", {})
         changed = {kind for kind in KINDS if initial or stamp[kind] != previous_stamp.get(kind)}
-        if not (inventory_due or changed or state.get("attempt") or state.get("pending_retry")):
+        if not (
+            inventory_due
+            or changed
+            or state.get("attempt")
+            or state.get("pending_retry")
+            or state.get("refresh_after")
+        ):
             return state
         async with self.e.locks[member]:
             await self.account(member, generation)
@@ -485,7 +535,14 @@ class BackgroundImport:
         }
         previous_inventory = await self.snapshot(member, "inventory", generation)
         inventory_changed = inventory != previous_inventory
-        if changed or inventory_changed or state.get("attempt") or state.get("pending_retry"):
+        if (
+            changed
+            or inventory_changed
+            or state.get("attempt")
+            or state.get("pending_retry")
+            or state.get("refresh_after")
+            or requested
+        ):
             pending = dict(before)
             snapshots = {}
             changed_records = set()
@@ -521,6 +578,12 @@ class BackgroundImport:
                 pending.update(found)
             if changed and await self.activities(member, generation) != stamp:
                 raise RetryScan("Trakt 历史在扫描期间更新，稍后重新核对")
+            refresh_after = state.get("refresh_after")
+            if refresh_after or requested or (inventory_changed and previous_inventory is not None):
+                refreshed, refresh_after = await self.refresh_pending(
+                    member, generation, pending, index, refresh_after or ""
+                )
+                changed_records.update(refreshed)
             candidates = []
             reconsider = (
                 pending.keys()
@@ -540,14 +603,20 @@ class BackgroundImport:
             candidates.sort(key=lambda fact: timestamp(fact[2]), reverse=True)
             if any(timestamp(fact[2]) > self.e.clock() for fact in candidates):
                 raise RetryScan("Trakt 观看时间尚未到达，稍后核对")
-            async with self.e.locks[member]:
-                await self.account(member, generation)
-                await self.verify_member(member)
-                # If interrupted while persisting these indexes, reconsider all staged
-                # records on restart, even if the inventory fingerprint is unchanged.
+
+            @asynccontextmanager
+            async def bound_member():
+                async with self.e.locks[member]:
+                    await self.account(member, generation)
+                    await self.verify_member(member)
+                    yield
+
+            async with bound_member():
+                # Publish recovery intent before any pending or snapshot updates.
                 state["pending_retry"] = True
                 await self.e.set(member, "background_import", state)
-                await records.save_pending(before, pending)
+            await records.save_pending(before, pending, bound_member)
+            async with bound_member():
                 for kind, (remote, previous) in snapshots.items():
                     await self.save_snapshot(member, f"remote_{kind}", generation, remote, previous)
                 if inventory_changed:
@@ -555,15 +624,13 @@ class BackgroundImport:
                         member, "inventory", generation, inventory, previous_inventory
                     )
                 # Incoming records and the checkpoint become durable before any remote write.
-                state.update(stamp=stamp, record_ledger=True)
+                state.update(stamp=stamp, record_ledger=True, refresh_after=refresh_after)
                 await self.e.set(member, "background_import", state)
             applied, held, conflict, finished = await self.apply(
                 member, generation, records, candidates
             )
             remaining = {key: row for key, row in pending.items() if int(key) not in finished}
-            async with self.e.locks[member]:
-                await self.account(member, generation)
-                await records.save_pending(pending, remaining)
+            await records.save_pending(pending, remaining, bound_member)
             state["imported"] = state.get("imported", 0) + applied
             state["protected"] = state.get("protected", 0) + held
             if applied:
@@ -609,6 +676,7 @@ class BackgroundImport:
                 requested
                 or now >= state.get("catalog_due", 0)
                 or self.catalog_revision.get(member, -1) != self.library_revision,
+                requested=requested,
             )
             state.update(last_checked=iso_time(self.e.clock()), error=None, attempt=0, retry_at=0)
         except Superseded:

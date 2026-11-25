@@ -586,16 +586,26 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                 )
                 assert response.status_code == 200, response.text
 
+                from movieclaw_api.schemas.playback_sync import SyncImportIn
+
+                guarded_host = "expected_member_created_at" in SyncImportIn.model_fields
+
                 async def checked(previous=None):
                     async with asyncio.timeout(5):
                         while True:
                             state = (await web.get(profile_url)).json()["background_import"]
-                            if state["last_checked"] and state["last_checked"] != previous:
-                                assert not state["error"]
+                            if state["error"] or (
+                                state["last_checked"] and state["last_checked"] != previous
+                            ):
                                 return state
                             await asyncio.sleep(0.02)
 
                 first_check = await checked()
+                if not guarded_host:
+                    assert "版本暂不支持成员后台导入" in first_check["error"]
+                    assert first_check["imported"] == 0
+                    return
+                assert not first_check["error"]
                 assert first_check["imported"] == 0
                 async with get_database().session() as s:
                     files = [
@@ -625,6 +635,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                     LIBRARY_FILES_ADDED, FilesAdded(library_id=library.id, files=event_files)
                 )
                 second_check = await checked(first_check["last_checked"])
+                assert not second_check["error"]
                 assert second_check["imported"] == 1
                 activity = (await web.get("/api/v1/plugins/trakt-sync/activity?member_id=2")).json()
                 incoming = [row for row in activity["records"] if row.get("direction") == "inbound"]

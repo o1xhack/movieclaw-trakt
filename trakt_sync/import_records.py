@@ -44,7 +44,7 @@ class ImportRecords:
             if namespace == self.namespace
         }
 
-    async def save_pending(self, before, after):
+    async def save_pending(self, before, after, guard):
         changed = {
             self.key(record_id)
             for record_id in before.keys() | after.keys()
@@ -54,11 +54,14 @@ class ImportRecords:
         for record_id, record in after.items():
             if self.key(record_id) in buckets:
                 buckets[self.key(record_id)][record_id] = [self.namespace, record]
-        for key, bucket in buckets.items():
-            if bucket:
-                await self.store.set(key, bucket, scope=self.pending_scope, secret=True)
-            else:
-                await self.store.delete(key, scope=self.pending_scope)
+        entries = list(buckets.items())
+        for offset in range(0, len(entries), 24):
+            async with guard():
+                for key, bucket in entries[offset : offset + 24]:
+                    if bucket:
+                        await self.store.set(key, bucket, scope=self.pending_scope, secret=True)
+                    else:
+                        await self.store.delete(key, scope=self.pending_scope)
 
     async def clear(self):
         for scope in (self.pending_scope, self.receipt_scope):

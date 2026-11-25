@@ -45,6 +45,8 @@ class Host:
         if op == "playback.sync.catalog":
             return {"items": list(self.units.values()), "next_cursor": None}
         assert op == "playback.sync.import"
+        if body["member_id"]:
+            assert body["expected_member_created_at"] == self.member_created
         outcomes = []
         for row in body["records"]:
             unit = self.units[row["episode"]]
@@ -530,3 +532,30 @@ async def test_watched_index_reads_all_pages_before_using_title_deltas(harness):
         "1": "1",
         "2": "2",
     }
+
+
+async def test_late_episode_matches_after_trakt_corrects_pending_title_ids(harness):
+    watch = episode(1, 1, "2020-01-01T11:00:00Z", series=999)
+
+    def trakt(request):
+        if request.url.path == "/sync/last_activities":
+            return httpx.Response(200, json={"episodes": {"watched_at": watch["watched_at"]}})
+        if request.url.path == "/sync/history/episodes":
+            return httpx.Response(200, json=[watch], headers={"X-Pagination-Page-Count": "1"})
+        if request.url.path == "/shows/800":
+            return httpx.Response(200, json={"ids": {"trakt": 800, "tmdb": 200}})
+        return None
+
+    engine, _, _, requests = await harness(trakt)
+    host = Host([local_episode(5)])
+    worker = BackgroundImport(engine, host)
+    await opt_in(engine, worker)
+    await worker.process(0)
+    assert not host.records
+
+    requests.clear()
+    host.units[1] = local_episode(1)
+    worker.inventory_changed()
+    await worker.process(0)
+    assert [request.url.path for request in requests] == ["/sync/last_activities", "/shows/800"]
+    assert [row["episode"] for row in host.records.values()] == [1]

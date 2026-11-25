@@ -433,7 +433,10 @@ async def test_recent_local_completion_keeps_source_time_and_sends_trakt_minute(
 async def test_local_completion_clears_matching_watching_then_adds_history_once(harness, event):
     def handler(request):
         if request.url.path == "/users/me/watching":
-            return httpx.Response(200, json={"started_at": started, "movie": {"ids": {"tmdb": 11}}})
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
 
     e, _, clock, requests = await harness(handler)
     started = iso_time(clock[0])
@@ -499,80 +502,26 @@ async def test_local_rewatches_are_distinct_and_each_replay_is_idempotent(harnes
     assert [r.url.path for r in requests].count("/sync/history") == 2
 
 
-async def test_watching_times_out_when_position_stops_moving_and_survives_restart(harness, event):
-    def handler(request):
-        if request.url.path == "/users/me/watching":
-            return httpx.Response(
-                200,
-                json={
-                    "action": "scrobble",
-                    "started_at": started,
-                    "movie": {"ids": {"tmdb": 11}},
-                },
-            )
-        return httpx.Response(201, json={"action": "pause"})
-
-    engine, store, clock, requests = await harness(handler)
+async def test_silent_or_stationary_playback_is_not_reported_as_stopped(harness, event):
+    engine, store, clock, requests = await harness()
     started = iso_time(clock[0])
     await engine.accept("started", {**event, "position_ms": 0}, "start", started)
     await engine.drain(0)
-    clock[0] += 120
-    await engine.accept("progress", event, "advanced", iso_time(clock[0]))
-    await engine.drain(0)
-    clock[0] += 120
-    await engine.accept("progress", event, "stationary", iso_time(clock[0]))
-    assert [r.url.path for r in requests] == ["/scrobble/start"]
+    clock[0] += 240
+    await engine.accept("progress", {**event, "position_ms": 0}, "stationary", iso_time(clock[0]))
     restarted = Engine(store, engine.client, engine.health, engine.log, clock=engine.clock)
     await restarted.drain(0)
-    assert len(requests) == 1
-    clock[0] += 30
-    await restarted.drain(0)
-    assert [r.url.path for r in requests] == [
-        "/scrobble/start",
-        "/users/me/watching",
-        "/scrobble/pause",
-    ]
-    assert json.loads(requests[-1].content)["progress"] == 90
+    assert [r.url.path for r in requests] == ["/scrobble/start"]
     assert await store.get("delivery", scope="member:0") is None
-
-    # Progress that genuinely advances again can resume after idle cleanup.
-    clock[0] += 30
-    await restarted.accept(
-        "progress", {**event, "position_ms": 95000}, "resume", iso_time(clock[0])
-    )
-    await restarted.drain(0)
-    assert requests[-1].url.path == "/scrobble/start"
-
-
-@pytest.mark.parametrize("action, offset", [("checkin", 0), ("scrobble", 30)])
-async def test_idle_cleanup_does_not_clear_manually_started_or_newer_watching(
-    harness, event, action, offset
-):
-    def handler(request):
-        if request.url.path == "/users/me/watching":
-            return httpx.Response(
-                200,
-                json={
-                    "action": action,
-                    "started_at": iso_time(started + offset),
-                    "movie": {"ids": {"tmdb": 11}},
-                },
-            )
-        return httpx.Response(201, json={"action": "start"})
-
-    engine, _, clock, requests = await harness(handler)
-    started = clock[0]
-    await engine.accept("started", event, "start", iso_time(started))
-    await engine.drain(0)
-    clock[0] += 150
-    await engine.drain(0)
-    assert [r.url.path for r in requests] == ["/scrobble/start", "/users/me/watching"]
 
 
 async def test_stop_without_duration_runs_watching_cleanup_immediately(harness, event):
     def handler(request):
         if request.url.path == "/users/me/watching":
-            return httpx.Response(200, json={"started_at": started, "movie": {"ids": {"tmdb": 11}}})
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
         return httpx.Response(201, json={})
 
     engine, _, clock, requests = await harness(handler)
@@ -597,3 +546,29 @@ async def test_stop_without_duration_cancels_start_that_is_still_queued(harness,
     await engine.drain(0)
     assert not requests
     assert not await store.get("delivery", scope="member:0")
+
+
+@pytest.mark.parametrize("action, offset", [("checkin", 0), ("scrobble", 30)])
+async def test_stop_without_duration_does_not_pause_a_different_trakt_session(
+    harness, event, action, offset
+):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": action,
+                    "started_at": iso_time(started + offset),
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return httpx.Response(201, json={"action": "start"})
+
+    engine, _, clock, requests = await harness(handler)
+    started = clock[0]
+    await engine.accept("started", event, "start", iso_time(started))
+    await engine.drain(0)
+    clock[0] += 60
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/start", "/users/me/watching"]
