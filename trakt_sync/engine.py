@@ -339,9 +339,22 @@ class Engine(ActivityLog, Recovery):
     async def initialize(self):
         # scopes(account) 会一次解密全部账号。先从明文 ledger/linked 找出成员，再逐个读凭据。
         async with self.bootstrap:
-            if await self.store.get("delivery-index-v3", default=False):
+            indexed = await self.store.get("delivery-index-v3", default=False)
+            watching_migrated = await self.store.get("watching-opt-in-v1", default=False)
+            if indexed and watching_migrated:
                 return
             ledgers = await self.store.scopes("ledger", entity="member")
+            if not watching_migrated:
+                for scope, ledger in ledgers.items():
+                    if not (ledger.get("live_watching") or ledger.get("unconfirmed_start")):
+                        continue
+                    member = int(scope.split(":", 1)[1])
+                    async with self.locks[member]:
+                        if not await self.get(member, "report_watching", False):
+                            await self.disable_watching(member)
+                await self.store.set("watching-opt-in-v1", True)
+            if indexed:
+                return
             linked = await self.store.scopes("linked", entity="member")
             scopes = set(ledgers) | set(linked) | {self.scope(0)}
             for scope in scopes:
@@ -670,7 +683,7 @@ class Engine(ActivityLog, Recovery):
         for marker in ("unconfirmed_start", "live_watching"):
             if live := ledger.get(marker):
                 ledger.setdefault("watching_cleanups", {}).setdefault(
-                    live["key"],
+                    f"{live['key']}:{live['sent_at']}",
                     {
                         "live": live,
                         "stopped_at": now,
@@ -1144,7 +1157,7 @@ class Engine(ActivityLog, Recovery):
                 {**live["item"], "progress": live["progress"]},
             )
 
-    async def retry_watching_cleanup(self, member, account, ledger, cleanup):
+    async def retry_watching_cleanup(self, member, account, ledger, cleanup_id, cleanup):
         live = cleanup["live"]
         pending = ledger["watching_cleanups"]
         current = ledger.get("live_watching")
@@ -1154,7 +1167,7 @@ class Engine(ActivityLog, Recovery):
             and matches(live["item"], current["item"])
         )
         if superseded or self.clock() > cleanup["expires_at"]:
-            pending.pop(live["key"], None)
+            pending.pop(cleanup_id, None)
         else:
             try:
                 await self.pause_owned_watching(
@@ -1171,7 +1184,7 @@ class Engine(ActivityLog, Recovery):
                 if exc.status == 429:
                     ledger["requests_not_before"] = cleanup["next_at"]
             else:
-                pending.pop(live["key"], None)
+                pending.pop(cleanup_id, None)
                 self.clear_watching_markers(ledger, live["key"], live["sent_at"])
         await self.save_ledger(member, ledger)
 
@@ -1198,16 +1211,16 @@ class Engine(ActivityLog, Recovery):
             if self.clock() < ledger.get("requests_not_before", 0):
                 return
             cleanup = min(
-                ledger.get("watching_cleanups", {}).values(),
-                key=lambda record: record["next_at"],
+                ledger.get("watching_cleanups", {}).items(),
+                key=lambda entry: entry[1]["next_at"],
                 default=None,
             )
             if (
                 cleanup
-                and cleanup["next_at"] <= self.clock()
+                and cleanup[1]["next_at"] <= self.clock()
                 and (not ledger["queue"] or ledger["queue"][0]["next_at"] > self.clock())
             ):
-                await self.retry_watching_cleanup(member, account, ledger, cleanup)
+                await self.retry_watching_cleanup(member, account, ledger, *cleanup)
                 return
             if not ledger["queue"]:
                 await self._retry_locked(member, automatic=True)

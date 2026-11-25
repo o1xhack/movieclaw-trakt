@@ -927,3 +927,40 @@ async def test_turning_watching_off_cancels_queued_start_and_clears_owned_status
     await engine.accept("completed", other, "complete", iso_time(clock[0]))
     await engine.drain(0)
     assert requests[-1].url.path == "/sync/history"
+
+
+async def test_default_off_upgrade_clears_the_acknowledged_start_after_an_uncertain_retry(
+    harness, event
+):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
+        if request.url.path == "/scrobble/start" and clock[0] > start_time:
+            raise httpx.ReadError("fixture lost start", request=request)
+        return None
+
+    engine, store, clock, requests = await harness(handler)
+    start_time = clock[0]
+    started = iso_time(start_time)
+    await engine.accept("started", event, "first", started)
+    await engine.drain(0)
+    clock[0] += 20
+    await engine.accept("started", event, "second", iso_time(clock[0]))
+    await engine.drain(0)
+    await store.delete("report_watching", scope="member:0")
+    await store.set("delivery-index-v3", True)
+
+    restarted = Engine(store, engine.client, engine.health, engine.log, clock=engine.clock)
+    await restarted.initialize()
+    await restarted.drain(0)
+    await restarted.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/scrobble/start",
+        "/users/me/watching",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]

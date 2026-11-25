@@ -154,6 +154,7 @@ def test_real_process_boot_with_original_routes_and_admin_boundary(host):
     assert c.get(path + "/profile?member_id=2").json()["preferences"] == {
         **prefs,
         "automatic_import": False,
+        "report_watching": False,
     }
     assert not c.get(path + "/profile?member_id=0").json()["preferences"]["manual_watched"]
     assert c.get(path + "/history").json()["tasks"] == []

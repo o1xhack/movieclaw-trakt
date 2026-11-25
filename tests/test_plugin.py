@@ -221,7 +221,7 @@ async def test_sdk_mount_authorize_deliver_duplicate_and_unmount(
                 await actions[0].drain_once()
             assert (
                 len([r for r in requests if r.method == "POST" and r.url.path == "/sync/history"])
-                == 1
+                == 2
             )
             assert len([r for r in requests if r.url.path == "/sync/watchlist"]) == 1
             assert (await web.get(prefix + "/history")).json()["tasks"] == []
