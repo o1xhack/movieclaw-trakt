@@ -433,9 +433,10 @@ async def test_recent_local_completion_keeps_source_time_and_sends_trakt_minute(
 async def test_local_completion_clears_matching_watching_then_adds_history_once(harness, event):
     def handler(request):
         if request.url.path == "/users/me/watching":
-            return httpx.Response(200, json={"movie": {"ids": {"tmdb": 11}}})
+            return httpx.Response(200, json={"started_at": started, "movie": {"ids": {"tmdb": 11}}})
 
     e, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
     payload = {**event, "viewing_id": "live-local-copy"}
     await e.accept("started", {**payload, "position_ms": 0}, "local-start", iso_time(clock[0]))
     await e.drain(0)
