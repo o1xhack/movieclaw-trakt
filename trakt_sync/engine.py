@@ -41,6 +41,7 @@ class Engine(ActivityLog, Recovery):
         self.wake = asyncio.Event()
         self.bootstrap = asyncio.Lock()
         self.delivery_failures = {}
+        self.watching_migration_due = None
 
     @staticmethod
     def scope(member):
@@ -340,27 +341,46 @@ class Engine(ActivityLog, Recovery):
         # scopes(account) 会一次解密全部账号。先从明文 ledger/linked 找出成员，再逐个读凭据。
         async with self.bootstrap:
             indexed = await self.store.get("delivery-index-v3", default=False)
-            watching_migrated = await self.store.get("watching-opt-in-v1", default=False)
-            if indexed and watching_migrated:
+            watching_migration = await self.store.get("watching-opt-in-v1", default=False)
+            self.watching_migration_due = (
+                watching_migration["retry_at"] if isinstance(watching_migration, dict) else None
+            )
+            migrate_watching = watching_migration is not True and (
+                self.watching_migration_due is None or self.watching_migration_due <= self.clock()
+            )
+            if indexed and not migrate_watching:
                 return
-            ledgers = await self.store.scopes("ledger", entity="member")
-            if not watching_migrated:
-                for scope, ledger in ledgers.items():
-                    if not (ledger.get("live_watching") or ledger.get("unconfirmed_start")):
-                        continue
-                    value = scope.split(":", 1)[-1]
-                    if not value.isdigit():
-                        continue
-                    member = int(value)
+            ledgers = (
+                await self.store.scopes("ledger", entity="member")
+                if not indexed or not watching_migration
+                else {}
+            )
+            if migrate_watching:
+                if isinstance(watching_migration, dict):
+                    members = watching_migration["members"]
+                else:
+                    members = [
+                        int(scope.split(":", 1)[1])
+                        for scope, ledger in ledgers.items()
+                        if scope.split(":", 1)[-1].isdigit()
+                        and (ledger.get("live_watching") or ledger.get("unconfirmed_start"))
+                    ]
+                retry = []
+                for member in members:
                     try:
                         async with self.locks[member]:
                             if not await self.get(member, "report_watching", False):
                                 await self.disable_watching(member)
                     except Exception as exc:
+                        retry.append(member)
                         self.log.warning(
                             "Trakt 单个成员的正在观看状态无法清理（%s）", type(exc).__name__
                         )
-                await self.store.set("watching-opt-in-v1", True)
+                self.watching_migration_due = self.clock() + 60 if retry else None
+                await self.store.set(
+                    "watching-opt-in-v1",
+                    {"members": retry, "retry_at": self.watching_migration_due} if retry else True,
+                )
             if indexed:
                 return
             linked = await self.store.scopes("linked", entity="member")
@@ -688,7 +708,12 @@ class Engine(ActivityLog, Recovery):
         ledger = await self.ledger(member)
         ledger["queue"][:] = [job for job in ledger["queue"] if job["path"] != "/scrobble/start"]
         now = self.clock()
-        cleanups = ledger.setdefault("watching_cleanups", {})
+        cleanups = {
+            key: cleanup
+            for key, cleanup in ledger.get("watching_cleanups", {}).items()
+            if cleanup["expires_at"] >= now
+        }
+        ledger["watching_cleanups"] = cleanups
         for marker in ("unconfirmed_start", "live_watching"):
             live = ledger.get(marker)
             if not live or any(
@@ -1530,15 +1555,13 @@ class Engine(ActivityLog, Recovery):
                 await self.initialize()
                 await self.deliver_ready(await self.store.scopes("delivery", entity="member"))
                 work = await self.store.scopes("delivery", entity="member")
-                delay = (
-                    max(
-                        1,
-                        min(self.due_at(int(s.split(":", 1)[1]), m) for s, m in work.items())
-                        - self.clock(),
-                    )
-                    if work
-                    else None
-                )
+                deadlines = [
+                    self.due_at(int(scope.split(":", 1)[1]), marker)
+                    for scope, marker in work.items()
+                ]
+                if self.watching_migration_due is not None:
+                    deadlines.append(self.watching_migration_due)
+                delay = max(1, min(deadlines) - self.clock()) if deadlines else None
                 failures = 0
                 try:
                     await asyncio.wait_for(self.wake.wait(), timeout=delay)

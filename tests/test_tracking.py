@@ -966,7 +966,8 @@ async def test_default_off_upgrade_clears_the_acknowledged_start_after_an_uncert
     ]
 
 
-async def test_opt_out_preserves_an_existing_cleanup_for_the_same_start(harness, event):
+@pytest.mark.parametrize("expired", [False, True])
+async def test_opt_out_preserves_only_unexpired_cleanup_for_the_same_start(harness, event, expired):
     engine, _, clock, _ = await harness()
     await engine.accept("started", {**event, "position_ms": 20_000}, "start", iso_time(clock[0]))
     await engine.drain(0)
@@ -980,10 +981,18 @@ async def test_opt_out_preserves_an_existing_cleanup_for_the_same_start(harness,
     }
     ledger["watching_cleanups"] = {live["key"]: completion_cleanup}
     await engine.save_ledger(0, ledger)
+    if expired:
+        clock[0] += 301
     async with engine.locks[0]:
         await engine.set(0, "report_watching", False)
         await engine.disable_watching(0)
-    assert (await engine.ledger(0))["watching_cleanups"] == {live["key"]: completion_cleanup}
+    pending = (await engine.ledger(0))["watching_cleanups"]
+    if expired:
+        cleanup = next(iter(pending.values()))
+        assert len(pending) == 1
+        assert cleanup["live"] == live and cleanup["next_at"] == clock[0]
+    else:
+        assert pending == {live["key"]: completion_cleanup}
 
 
 async def test_watching_upgrade_recovers_other_members_if_one_ledger_write_fails(
@@ -1006,3 +1015,9 @@ async def test_watching_upgrade_recovers_other_members_if_one_ledger_write_fails
     await engine.initialize()
     assert not (await engine.ledger(0)).get("watching_cleanups")
     assert (await engine.ledger(2))["watching_cleanups"]
+    assert (await store.get("watching-opt-in-v1"))["members"] == [0]
+    monkeypatch.setattr(store, "set", set_value)
+    clock[0] += 60
+    await engine.initialize()
+    assert (await engine.ledger(0))["watching_cleanups"]
+    assert await store.get("watching-opt-in-v1") is True
