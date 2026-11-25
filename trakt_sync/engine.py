@@ -725,11 +725,35 @@ class Engine(ActivityLog, Recovery):
                         "path": "/scrobble/start",
                         "body": {**item, "progress": rate or 0},
                     }
+                elif kind == "progress" and rate is not None:
+                    live = ledger.get("live_watching", {})
+                    position = event["position_ms"]
+                    elapsed = at - state.get("sample_at", at)
+                    traveled = position - state.get("sample_position", position)
+                    state.update(at=at, sample_at=at, sample_position=position)
+                    if live.get("key") == key:
+                        live["progress"] = rate
+                    elif not state.get("session") or state.get("closed"):
+                        # A seek can move the position without playback. Require two
+                        # consecutive advances at a plausible rate before inferring a start.
+                        moving = 5 <= elapsed <= 150 and 250 * elapsed <= traveled <= 4000 * elapsed
+                        state["moving_reports"] = (
+                            state.get("moving_reports", 0) + 1 if moving else 0
+                        )
+                        if state["moving_reports"] >= 2:
+                            state = {"session": event_id, "at": at}
+                            request = {
+                                "path": "/scrobble/start",
+                                "body": {**item, "progress": rate},
+                            }
                 elif not state.get("closed") or (completed and "terminal_at" not in state):
                     state["at"] = at
                     live = ledger.get("live_watching", {})
                     if kind in ("stopped", "completed"):
                         state["closed"] = True
+                        state.pop("sample_at", None)
+                        state.pop("sample_position", None)
+                        state.pop("moving_reports", None)
                         if rate is not None and rate > 80:
                             state["terminal_at"] = at
                         if rate is not None:
@@ -742,25 +766,6 @@ class Engine(ActivityLog, Recovery):
                             request = {
                                 "path": "/scrobble/pause",
                                 "body": {**item, "progress": live["progress"]},
-                            }
-                    elif kind == "progress" and rate is not None:
-                        position = event["position_ms"]
-                        previous = state.get("position")
-                        state["position"] = position
-                        if live.get("key") == key:
-                            live["progress"] = rate
-                        elif (
-                            not live
-                            and not state.get("session")
-                            and previous is not None
-                            and position > previous
-                        ):
-                            # Clients can miss started (for example, linking Trakt mid-play).
-                            # Two advancing reports establish playback, and only start it once.
-                            state["session"] = event_id
-                            request = {
-                                "path": "/scrobble/start",
-                                "body": {**item, "progress": rate},
                             }
             if item and kind in {"stopped", "completed"} and at >= state.get("at", 0):
                 ledger["queue"] = [

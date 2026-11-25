@@ -582,7 +582,46 @@ async def test_movement_without_an_initial_start_opens_a_single_scrobble(harness
             "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
         )
         await engine.drain(0)
-        if offset < 2:
+        if offset < 3:
             assert not requests
     assert [r.url.path for r in requests] == ["/scrobble/start"]
-    assert json.loads(requests[0].content)["progress"] == 20
+    assert json.loads(requests[0].content)["progress"] == 30
+
+
+async def test_seek_only_does_not_infer_a_playback_start(harness, event):
+    engine, _, clock, requests = await harness()
+    for offset, position in enumerate((0, 80_000, 95_000)):
+        clock[0] += 1
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"seek-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    assert not requests
+
+
+@pytest.mark.parametrize("prior_stop", [False, True])
+async def test_missing_start_recovers_after_an_abandoned_title_or_same_title_stop(
+    harness, event, prior_stop
+):
+    engine, _, clock, requests = await harness()
+    await engine.accept("started", event, "old-start", iso_time(clock[0]))
+    await engine.drain(0)
+    if prior_stop:
+        clock[0] += 2
+        await engine.accept(
+            "stopped", {**event, "position_ms": 20000}, "old-stop", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    else:
+        event = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    assert [r.url.path for r in requests] == (
+        ["/scrobble/start", "/scrobble/stop", "/scrobble/start"]
+        if prior_stop
+        else ["/scrobble/start", "/scrobble/start"]
+    )
