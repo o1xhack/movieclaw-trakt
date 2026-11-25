@@ -751,7 +751,12 @@ class Engine(ActivityLog, Recovery):
                             state.get("moving_reports", 0) + 1 if moving else 0
                         )
                         if state["moving_reports"] >= 2:
-                            state["inferred_start"] = event_id
+                            # Movement reopens local playback even if Trakt has an active
+                            # session from another device and we cannot send this start.
+                            state.pop("closed", None)
+                            state.pop("terminal_at", None)
+                            state.pop("session", None)
+                            state.update(inferred_only=True, inferred_start=event_id)
                             request = {
                                 "path": "/scrobble/start",
                                 "body": {**item, "progress": rate},
@@ -767,7 +772,13 @@ class Engine(ActivityLog, Recovery):
                         state.pop("moving_reports", None)
                         if rate is not None and rate > 80:
                             state["terminal_at"] = at
-                        if rate is not None:
+                        if state.get("inferred_only") and live.get("key") != key:
+                            if rate is not None and rate > 80:
+                                request = {
+                                    "path": "/sync/history",
+                                    "body": history_body(item, occurred_at),
+                                }
+                        elif rate is not None:
                             request = {
                                 "path": "/scrobble/stop",
                                 "body": {**item, "progress": rate},
@@ -984,19 +995,25 @@ class Engine(ActivityLog, Recovery):
         state = ledger["sessions"].get(job["key"], {})
         if state.get("inferred_start") != job["id"]:
             return {"action": "expired"}
-        current = await self.authorized(member, account, "GET", "/users/me/watching")
-        if current:
-            # A known start can replace watching; an inferred start must not.
-            state.pop("inferred_start", None)
-            state["moving_reports"] = 0
-            state["retry_inferred_at"] = self.clock() + 60
-            return {"action": "expired"}
-        result = await self.start_watching(member, account, ledger, job)
-        ledger["sessions"][job["key"]] = {
-            "session": job["id"],
-            "at": timestamp(job["occurred_at"]),
-        }
-        return result
+        try:
+            current = await self.authorized(member, account, "GET", "/users/me/watching")
+            if not current:
+                result = await self.start_watching(member, account, ledger, job)
+                ledger["sessions"][job["key"]] = {
+                    "session": job["id"],
+                    "at": timestamp(job["occurred_at"]),
+                }
+                return result
+            retry_after = 60
+        except TraktError as exc:
+            if exc.auth_error:
+                raise
+            # An optional start must not delay a real stop or viewing record in the queue.
+            retry_after = max(60, exc.retry_after)
+        state.pop("inferred_start", None)
+        state["moving_reports"] = 0
+        state["retry_inferred_at"] = self.clock() + retry_after
+        return {"action": "expired"}
 
     async def start_watching(self, member, account, ledger, job):
         previous = ledger.get("live_watching")

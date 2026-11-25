@@ -656,3 +656,53 @@ async def test_inferred_start_does_not_replace_currently_watching_on_another_dev
         )
         await engine.drain(0)
     assert [r.url.path for r in requests] == ["/users/me/watching"]
+
+
+async def test_guarded_inference_still_records_a_rewatch_when_another_title_is_active(
+    harness, event
+):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(200, json={"action": "scrobble", "movie": {"ids": {"tmdb": 22}}})
+        if request.method == "GET" and request.url.path == "/sync/history/movies":
+            return httpx.Response(200, json=[])
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    await engine.accept("completed", event, "previous-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    clock[0] += 20
+    await engine.accept("completed", event, "rewatch-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/stop",
+        "/users/me/watching",
+        "/sync/history/movies",
+        "/sync/history",
+    ]
+
+
+async def test_watching_lookup_outage_does_not_delay_another_completion(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(503)
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+    other = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    await engine.accept("completed", other, "other-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 1
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching", "/scrobble/stop"]
