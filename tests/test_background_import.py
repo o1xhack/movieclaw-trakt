@@ -184,6 +184,7 @@ async def test_conflict_backoff_local_unwatch_and_account_bound_opt_in(harness):
     assert not host.records
     retry = await engine.get(2, "background_import")
     assert retry["stamp"]["episodes"] == stamp and retry["retry_at"] > clock[0]
+    assert retry["protected"] == 1
     before = len(requests)
     await BackgroundImport(engine, host).process(2)
     assert len(requests) == before
@@ -191,7 +192,7 @@ async def test_conflict_backoff_local_unwatch_and_account_bound_opt_in(harness):
     host.conflict = False
     await worker.process(2)
     assert [r["episode"] for r in host.records.values()] == [2]
-    assert (await worker.status(2))["protected"] == 1
+    assert (await worker.status(2))["protected"] == 0
 
     before = len(requests)
     host.member_created = "2026-01-01T00:00:00Z"
@@ -559,3 +560,33 @@ async def test_late_episode_matches_after_trakt_corrects_pending_title_ids(harne
     await worker.process(0)
     assert [request.url.path for request in requests] == ["/sync/last_activities", "/shows/800"]
     assert [row["episode"] for row in host.records.values()] == [1]
+
+
+async def test_check_now_retries_pending_even_if_the_catalog_fingerprint_is_unchanged(harness):
+    row = episode(1, 1, "2020-01-01T11:00:00Z")
+
+    def trakt(request):
+        if request.url.path == "/sync/last_activities":
+            return httpx.Response(200, json={"episodes": {"watched_at": row["watched_at"]}})
+        if request.url.path == "/sync/history/episodes":
+            return httpx.Response(200, json=[row], headers={"X-Pagination-Page-Count": "1"})
+        return None
+
+    class TransientMismatchHost(Host):
+        async def call(self, op, body):
+            if op == "playback.sync.import" and self.conflict:
+                return {"outcomes": [{"status": "mismatch"}]}
+            return await super().call(op, body)
+
+    engine, _, _, requests = await harness(trakt)
+    host = TransientMismatchHost([local_episode(1)])
+    host.conflict = True
+    worker = BackgroundImport(engine, host)
+    await opt_in(engine, worker)
+    await worker.process(0)
+    assert not host.records
+    host.conflict = False
+    requests.clear()
+    await worker.process(0, requested=True)
+    assert [row["episode"] for row in host.records.values()] == [1]
+    assert not any(r.url.path.startswith("/sync/history/") for r in requests)

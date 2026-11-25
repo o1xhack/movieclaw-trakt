@@ -587,7 +587,12 @@ class BackgroundImport:
             candidates = []
             reconsider = (
                 pending.keys()
-                if (inventory_changed or state.get("pending_retry") or state.get("attempt"))
+                if (
+                    requested
+                    or inventory_changed
+                    or state.get("pending_retry")
+                    or state.get("attempt")
+                )
                 else changed_records
             )
             for record_id in tuple(reconsider):
@@ -632,7 +637,7 @@ class BackgroundImport:
             remaining = {key: row for key, row in pending.items() if int(key) not in finished}
             await records.save_pending(pending, remaining, bound_member)
             state["imported"] = state.get("imported", 0) + applied
-            state["protected"] = state.get("protected", 0) + held
+            state["protected"] = held
             if applied:
                 state["last_imported"] = iso_time(self.e.clock())
             if conflict:
@@ -669,6 +674,7 @@ class BackgroundImport:
             self.retry[member] = self.due[member]
             return
         try:
+            state["protected"] = 0
             await self.reconcile(
                 member,
                 generation,

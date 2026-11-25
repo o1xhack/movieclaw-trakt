@@ -743,8 +743,25 @@ class Engine(ActivityLog, Recovery):
                                 "path": "/scrobble/pause",
                                 "body": {**item, "progress": live["progress"]},
                             }
-                    elif kind == "progress" and rate is not None and live.get("key") == key:
-                        live["progress"] = rate
+                    elif kind == "progress" and rate is not None:
+                        position = event["position_ms"]
+                        previous = state.get("position")
+                        state["position"] = position
+                        if live.get("key") == key:
+                            live["progress"] = rate
+                        elif (
+                            not live
+                            and not state.get("session")
+                            and previous is not None
+                            and position > previous
+                        ):
+                            # Clients can miss started (for example, linking Trakt mid-play).
+                            # Two advancing reports establish playback, and only start it once.
+                            state["session"] = event_id
+                            request = {
+                                "path": "/scrobble/start",
+                                "body": {**item, "progress": rate},
+                            }
             if item and kind in {"stopped", "completed"} and at >= state.get("at", 0):
                 ledger["queue"] = [
                     job

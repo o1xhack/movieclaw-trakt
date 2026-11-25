@@ -572,3 +572,17 @@ async def test_stop_without_duration_does_not_pause_a_different_trakt_session(
     await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
     await engine.drain(0)
     assert [r.url.path for r in requests] == ["/scrobble/start", "/users/me/watching"]
+
+
+async def test_movement_without_an_initial_start_opens_a_single_scrobble(harness, event):
+    engine, _, clock, requests = await harness()
+    for offset, position in enumerate((10_000, 10_000, 20_000, 30_000)):
+        clock[0] += 30
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+        if offset < 2:
+            assert not requests
+    assert [r.url.path for r in requests] == ["/scrobble/start"]
+    assert json.loads(requests[0].content)["progress"] == 20
