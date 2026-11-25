@@ -304,6 +304,8 @@ class Engine(ActivityLog, Recovery):
             if queue
             else [j["retry_at"] for j in ledger.get("failed", []) if "retry_at" in j]
         )
+        if cleanup := ledger.get("watching_cleanup"):
+            deadlines.append(cleanup["next_at"])
         if deadlines:
             await self.set(
                 member,
@@ -320,6 +322,7 @@ class Engine(ActivityLog, Recovery):
         await self.set(member, "account", {**current, "blocked": True}, secret=True)
         ledger.pop("live_watching", None)
         ledger.pop("unconfirmed_start", None)
+        ledger.pop("watching_cleanup", None)
         ledger.update(
             queue=[],
             failed=[],
@@ -1111,6 +1114,28 @@ class Engine(ActivityLog, Recovery):
                 {**live["item"], "progress": live["progress"]},
             )
 
+    async def retry_watching_cleanup(self, member, account, ledger, cleanup):
+        live = self.watching_for(ledger, cleanup["key"])
+        now = self.clock()
+        if not live or live["sent_at"] != cleanup["sent_at"] or now > cleanup["expires_at"]:
+            ledger.pop("watching_cleanup", None)
+        else:
+            try:
+                await self.pause_owned_watching(member, account, {**live, "progress": 100})
+            except TraktError as exc:
+                if exc.auth_error:
+                    await self.block_auth(member, account, ledger)
+                    return
+                cleanup["next_at"] = now + max(60, exc.retry_after)
+                if exc.status == 429:
+                    ledger["requests_not_before"] = cleanup["next_at"]
+            else:
+                ledger.pop("watching_cleanup", None)
+                for marker in ("live_watching", "unconfirmed_start"):
+                    if ledger.get(marker, {}).get("key") == cleanup["key"]:
+                        ledger.pop(marker)
+        await self.save_ledger(member, ledger)
+
     async def drain(self, member):
         async with self.locks[member]:
             account = await self.get(member, "account", {})
@@ -1125,6 +1150,14 @@ class Engine(ActivityLog, Recovery):
             await self.store.delete("storage_error", scope=self.scope(member))
             ledger = await self.ledger(member)
             if self.clock() < ledger.get("requests_not_before", 0):
+                return
+            cleanup = ledger.get("watching_cleanup")
+            if (
+                cleanup
+                and cleanup["next_at"] <= self.clock()
+                and (not ledger["queue"] or ledger["queue"][0]["next_at"] > self.clock())
+            ):
+                await self.retry_watching_cleanup(member, account, ledger, cleanup)
                 return
             if not ledger["queue"]:
                 await self._retry_locked(member, automatic=True)
@@ -1215,6 +1248,12 @@ class Engine(ActivityLog, Recovery):
                                 except TraktError as exc:
                                     if exc.auth_error or exc.status == 429:
                                         raise
+                                    ledger["watching_cleanup"] = {
+                                        "key": job["key"],
+                                        "sent_at": live["sent_at"],
+                                        "next_at": self.clock() + max(60, exc.retry_after),
+                                        "expires_at": self.clock() + 300,
+                                    }
                                 else:
                                     for marker in ("live_watching", "unconfirmed_start"):
                                         if ledger.get(marker, {}).get("key") == job["key"]:

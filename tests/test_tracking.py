@@ -782,18 +782,28 @@ async def test_slow_watching_lookup_never_sends_an_expired_start(harness, event)
 
 
 async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(harness, event):
+    lookups = 0
+
     def handler(request):
+        nonlocal lookups
         if request.url.path == "/scrobble/start":
             raise httpx.ReadError("lost start response", request=request)
         if request.url.path == "/users/me/watching":
-            return httpx.Response(503)
+            lookups += 1
+            if lookups == 1:
+                return httpx.Response(503)
+            return httpx.Response(
+                200,
+                json={"action": "scrobble", "started_at": started, "movie": {"ids": {"tmdb": 11}}},
+            )
         if request.method == "GET" and request.url.path == "/sync/history/movies":
             return httpx.Response(200, json=[])
         return None
 
-    engine, _, clock, requests = await harness(handler)
+    engine, store, clock, requests = await harness(handler)
     payload = {**event, "viewing_id": "same-session"}
-    await engine.accept("started", payload, "start", iso_time(clock[0]))
+    started = iso_time(clock[0])
+    await engine.accept("started", payload, "start", started)
     await engine.drain(0)
     clock[0] += 5
     await engine.accept("completed", payload, "stop", iso_time(clock[0]))
@@ -804,6 +814,11 @@ async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(harne
         "/users/me/watching",
         "/sync/history",
     ]
+    assert (await store.get("delivery", scope="member:0"))["next_at"] == clock[0] + 60
+    clock[0] += 60
+    await engine.drain(0)
+    assert [r.url.path for r in requests[-2:]] == ["/users/me/watching", "/scrobble/pause"]
+    assert await store.get("delivery", scope="member:0") is None
 
 
 async def test_legacy_watching_without_recorded_bounds_is_not_cleared(harness, event):
