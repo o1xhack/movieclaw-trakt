@@ -319,6 +319,7 @@ class Engine(ActivityLog, Recovery):
         current = await self.get(member, "account", account)
         await self.set(member, "account", {**current, "blocked": True}, secret=True)
         ledger.pop("live_watching", None)
+        ledger.pop("unconfirmed_start", None)
         ledger.update(
             queue=[],
             failed=[],
@@ -720,8 +721,8 @@ class Engine(ActivityLog, Recovery):
                             "body": history_body(item, occurred_at),
                         }
                         if local_completion:
-                            request["clear_watching"] = (
-                                not stale and ledger.get("live_watching", {}).get("key") == key
+                            request["clear_watching"] = not stale and bool(
+                                self.watching_for(ledger, key)
                             )
                             state["closed"] = True
                             state["at"] = at
@@ -743,8 +744,9 @@ class Engine(ActivityLog, Recovery):
                     state.update(sample_at=at, sample_position=position)
                     if live.get("key") == key:
                         live["progress"] = rate
-                    elif (not state.get("session") or state.get("closed")) and not state.get(
-                        "inferred_start"
+                    elif not any(
+                        job["key"] == key and job["path"] == "/scrobble/start"
+                        for job in ledger["queue"]
                     ):
                         # A seek can move the position without playback. Require two
                         # consecutive advances at a plausible rate before inferring a start.
@@ -768,7 +770,7 @@ class Engine(ActivityLog, Recovery):
                                 }
                 elif not state.get("closed") or (completed and "terminal_at" not in state):
                     state["at"] = at
-                    live = ledger.get("live_watching", {})
+                    live = self.watching_for(ledger, key)
                     if kind in ("stopped", "completed"):
                         state["closed"] = True
                         state.pop("sample_at", None)
@@ -776,7 +778,7 @@ class Engine(ActivityLog, Recovery):
                         state.pop("moving_reports", None)
                         if rate is not None and rate > 80:
                             state["terminal_at"] = at
-                        if state.get("inferred_only") and live.get("key") != key:
+                        if state.get("inferred_only") and not live:
                             if rate is not None and rate > 80:
                                 request = {
                                     "path": "/sync/history",
@@ -787,7 +789,7 @@ class Engine(ActivityLog, Recovery):
                                 "path": "/scrobble/stop",
                                 "body": {**item, "progress": rate},
                             }
-                        elif live.get("key") == key:
+                        elif live:
                             # A real stop with unknown duration can still clear our own start.
                             request = {
                                 "path": "/scrobble/pause",
@@ -1021,29 +1023,52 @@ class Engine(ActivityLog, Recovery):
         state["retry_inferred_at"] = self.clock() + retry_after
         return {"action": "expired"}
 
+    @staticmethod
+    def watching_for(ledger, key):
+        for marker in ("unconfirmed_start", "live_watching"):
+            live = ledger.get(marker, {})
+            if live.get("key") == key:
+                return live
+        return {}
+
     async def start_watching(self, member, account, ledger, job):
-        sent_at = self.clock()
-
         async def before_send():
-            nonlocal sent_at
-            sent_at = self.clock()
+            now = self.clock()
+            if now - timestamp(job["occurred_at"]) > 300:
+                await self.save_inflight(member, ledger, job)
+            ledger["unconfirmed_start"] = {
+                "key": job["key"],
+                "item": job["item"],
+                "sent_at": now,
+                "window_end": now + 15,
+                "progress": job["body"]["progress"],
+            }
+            await self.save_inflight(member, ledger, job)
 
-        result = await self.authorized(
-            member, account, "POST", job["path"], job["body"], before_send=before_send
-        )
-        # A lost start response is not proof that Trakt accepted this session.
-        ledger["live_watching"] = {
-            "key": job["key"],
-            "item": job["item"],
-            "sent_at": sent_at,
-            "ack_at": self.clock(),
-            "progress": job["body"]["progress"],
-        }
+        async def clear_rejected():
+            ledger.pop("unconfirmed_start", None)
+            await self.save_ledger(member, ledger)
+
+        try:
+            result = await self.authorized(
+                member,
+                account,
+                "POST",
+                job["path"],
+                job["body"],
+                before_send=before_send,
+                after_rejection=clear_rejected,
+            )
+        except TraktError as exc:
+            if not exc.uncertain:
+                await clear_rejected()
+            raise
+        live = ledger.pop("unconfirmed_start")
+        live["window_end"] = self.clock() + 1
+        ledger["live_watching"] = live
         return result
 
     async def pause_owned_watching(self, member, account, live):
-        if "ack_at" not in live:
-            return
         current = await self.authorized(member, account, "GET", "/users/me/watching")
         if not isinstance(current, dict):
             raise TraktError(502)
@@ -1054,7 +1079,7 @@ class Engine(ActivityLog, Recovery):
             started_at = timestamp(started)
         except (AttributeError, TypeError, ValueError):
             return
-        if int(live["sent_at"]) <= started_at <= live["ack_at"] + 1:
+        if int(live["sent_at"]) <= started_at <= live["window_end"]:
             await self.authorized(
                 member,
                 account,
@@ -1158,16 +1183,14 @@ class Engine(ActivityLog, Recovery):
                             if recovered_id is not None:
                                 result["scrobble_history_id"] = recovered_id
                         else:
-                            live = ledger.get("live_watching", {})
-                            if (
-                                job.get("clear_watching")
-                                and not late
-                                and live.get("key") == job["key"]
-                            ):
+                            live = self.watching_for(ledger, job["key"])
+                            if job.get("clear_watching") and not late and live:
                                 await self.pause_owned_watching(
                                     member, account, {**live, "progress": 100}
                                 )
-                                ledger.pop("live_watching", None)
+                                for marker in ("live_watching", "unconfirmed_start"):
+                                    if ledger.get(marker, {}).get("key") == job["key"]:
+                                        ledger.pop(marker)
                             # Persist the change of write contract before POST. If this
                             # response is lost too, reconcile its explicit source minute.
                             job.pop("scrobble_window", None)
@@ -1188,8 +1211,8 @@ class Engine(ActivityLog, Recovery):
                     elif job["path"] == "/scrobble/start":
                         result = await self.deliver_start(member, account, ledger, job)
                     elif job["path"] == "/scrobble/pause":
-                        live = ledger.get("live_watching", {})
-                        if live.get("key") == job["key"]:
+                        live = self.watching_for(ledger, job["key"])
+                        if live:
                             await self.pause_owned_watching(member, account, live)
                         result = {"action": "pause"}
                     else:
@@ -1291,12 +1314,12 @@ class Engine(ActivityLog, Recovery):
             ledger["queue"][:] = [j for j in ledger["queue"] if j["id"] != job["id"]]
             if ledger["queue"]:
                 ledger["queue"][0]["next_at"] = max(ledger["queue"][0]["next_at"], self.clock() + 1)
-            if (
-                job["path"] in {"/scrobble/stop", "/scrobble/pause"}
-                and result.get("action") not in {"expired", "manual_unwatched", "local_deleted"}
-                and ledger.get("live_watching", {}).get("key") == job["key"]
-            ):
-                ledger.pop("live_watching", None)
+            if job["path"] in {"/scrobble/stop", "/scrobble/pause"} and result.get(
+                "action"
+            ) not in {"expired", "manual_unwatched", "local_deleted"}:
+                for marker in ("live_watching", "unconfirmed_start"):
+                    if ledger.get(marker, {}).get("key") == job["key"]:
+                        ledger.pop(marker)
             if result.get("action") not in {"expired", "manual_unwatched"}:
                 ledger["last_success"] = iso_time(self.clock())
             ledger["last_error"] = (

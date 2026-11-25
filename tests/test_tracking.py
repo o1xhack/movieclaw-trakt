@@ -729,3 +729,49 @@ async def test_watching_rate_limit_also_delays_other_queued_writes(harness, even
     clock[0] += 2
     await engine.drain(0)
     assert [r.url.path for r in requests][1:] == ["/sync/history/movies", "/sync/history"]
+
+
+async def test_lost_start_response_can_still_clear_watching_on_a_real_stop(harness, event):
+    def handler(request):
+        if request.url.path == "/scrobble/start":
+            raise httpx.ReadError("lost start response", request=request)
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": "scrobble",
+                    "started_at": started,
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
+    await engine.accept("started", event, "start", started)
+    await engine.drain(0)
+    clock[0] += 5
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+
+
+async def test_slow_watching_lookup_never_sends_an_expired_start(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            clock[0] += 301
+            return httpx.Response(204)
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching"]
