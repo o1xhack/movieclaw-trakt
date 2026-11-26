@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def host(tmp_path, monkeypatch):
+def host(tmp_path, monkeypatch, request):
     from fastapi.testclient import TestClient
     from movieclaw_api.core.config import get_settings
     from movieclaw_api.services import durable_events
@@ -42,12 +42,14 @@ def host(tmp_path, monkeypatch):
     (tmp_path / "plugins").mkdir()
     from scripts.package import build
 
-    # Boot exactly the allowlisted artifact, including its manifest, not loose source files.
-    with zipfile.ZipFile(build(tmp_path / "package")) as archive:
-        archive.extractall(tmp_path / "plugins")
-    (tmp_path / "plugins.yaml").write_text(
-        "- id: trakt-sync\n  module: trakt_sync\n  local: true\n  runtime: process\n"
-    )
+    artifact = build(tmp_path / "package")
+    if getattr(request, "param", None) != "package_manager":
+        # Boot exactly the allowlisted artifact, including its manifest, not loose source files.
+        with zipfile.ZipFile(artifact) as archive:
+            archive.extractall(tmp_path / "plugins")
+        (tmp_path / "plugins.yaml").write_text(
+            "- id: trakt-sync\n  module: trakt_sync\n  local: true\n  runtime: process\n"
+        )
     from movieclaw_api.app import create_app
 
     app = create_app()
@@ -149,8 +151,12 @@ def test_real_process_boot_with_original_routes_and_admin_boundary(host):
     assert response.status_code == 200, response.text
     prefs = {"manual_watched": True, "manual_unwatched": False, "favorites": True}
     assert c.put(path + "/profile?member_id=2", json=prefs).status_code == 200
-    assert c.get(path + "/profile?member_id=2").json()["preferences"] == prefs
-    assert c.get(path + "/profile?member_id=0").json()["preferences"] != prefs
+    assert c.get(path + "/profile?member_id=2").json()["preferences"] == {
+        **prefs,
+        "automatic_import": False,
+        "report_watching": False,
+    }
+    assert not c.get(path + "/profile?member_id=0").json()["preferences"]["manual_watched"]
     assert c.get(path + "/history").json()["tasks"] == []
     assert c.post(path + "/history", json={"direction": "invalid"}).status_code == 409
     login(2)
@@ -158,6 +164,35 @@ def test_real_process_boot_with_original_routes_and_admin_boundary(host):
         c.get(path + "/profile?member_id=2", headers={"X-MovieClaw-Member": "0"}).status_code == 403
     )
     assert c.put(path + "/profile?member_id=0", json=prefs).status_code == 403
+
+
+@pytest.mark.parametrize("host", ["package_manager"], indirect=True)
+def test_package_manager_approves_background_capabilities_and_defaults_off(host):
+    _, client, login, root = host
+    login(0)
+    (artifact,) = (root / "package").glob("*.mcplugin")
+    base = "/api/v1/app/plugins/packages"
+    result = client.post(base, files={"file": (artifact.name, artifact.read_bytes())})
+    assert result.status_code == 200, result.text
+    preview = result.json()["data"]
+    assert "members.show" in preview["operations"]
+    approved = client.post(
+        base + "/trakt-sync/approve",
+        json={
+            "version": preview["version"],
+            "operations": preview["operations"],
+            "paths": [],
+            "allow_web": True,
+        },
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["data"]["status"] == "active", approved.text
+    profile = client.get("/api/v1/plugins/trakt-sync/profile").json()
+    assert not profile["preferences"]["automatic_import"]
+    assert profile["background_import"]["last_checked"] is None
+    assert client.post("/api/v1/plugins/trakt-sync/background-import").status_code == 409
+    web = client.get("/api/v1/plugins/trakt-sync/web/index.html")
+    assert web.status_code == 200 and 'data-preference="automatic_import"' in web.text
 
 
 def test_marks_are_current_identity_only_and_playback_log_is_not_complete_state(host):

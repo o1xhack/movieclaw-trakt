@@ -141,6 +141,7 @@ def test_real_native_source_receipt_survives_later_stop_and_export(host, monkeyp
                 },
                 secret=True,
             )
+            await engine.set(0, "report_watching", True)
             if not export_first:
                 await engine.accept("completed", payload, event_id, occurred_at)
                 clock[0] = datetime(2020, 1, 1, 12, 35, 1)

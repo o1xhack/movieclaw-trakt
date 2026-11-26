@@ -132,7 +132,9 @@ async def test_lost_stop_response_checks_history_before_retry(harness, event):
             raise httpx.ReadError("response lost", request=request)
         if request.url.path.startswith("/sync/history/"):
             return httpx.Response(
-                200, json=[{"watched_at": iso_time(clock[0] - 60), "movie": {"ids": {"tmdb": 11}}}]
+                200,
+                headers={"X-Pagination-Page-Count": "1"},
+                json=[{"watched_at": iso_time(clock[0] - 60), "movie": {"ids": {"tmdb": 11}}}],
             )
 
     e, _, clock, requests = await harness(handler)
@@ -283,7 +285,9 @@ async def test_process_exit_after_remote_success_never_blindly_resends(harness, 
             raise RuntimeError("fixture process exit after remote commit")
         if request.url.path == "/sync/history/movies":
             return httpx.Response(
-                200, json=[{"movie": {"ids": {"tmdb": 11}}, "watched_at": iso_time(clock[0])}]
+                200,
+                headers={"X-Pagination-Page-Count": "1"},
+                json=[{"movie": {"ids": {"tmdb": 11}}, "watched_at": iso_time(clock[0])}],
             )
 
     e, store, clock, requests = await harness(handler)
@@ -429,9 +433,13 @@ async def test_recent_local_completion_keeps_source_time_and_sends_trakt_minute(
 async def test_local_completion_clears_matching_watching_then_adds_history_once(harness, event):
     def handler(request):
         if request.url.path == "/users/me/watching":
-            return httpx.Response(200, json={"movie": {"ids": {"tmdb": 11}}})
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
 
     e, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
     payload = {**event, "viewing_id": "live-local-copy"}
     await e.accept("started", {**payload, "position_ms": 0}, "local-start", iso_time(clock[0]))
     await e.drain(0)
@@ -492,3 +500,524 @@ async def test_local_rewatches_are_distinct_and_each_replay_is_idempotent(harnes
     clock[0] += 1
     await e.drain(0)
     assert [r.url.path for r in requests].count("/sync/history") == 2
+
+
+async def test_silent_or_stationary_playback_is_not_reported_as_stopped(harness, event):
+    engine, store, clock, requests = await harness()
+    started = iso_time(clock[0])
+    await engine.accept("started", {**event, "position_ms": 0}, "start", started)
+    await engine.drain(0)
+    clock[0] += 240
+    await engine.accept("progress", {**event, "position_ms": 0}, "stationary", iso_time(clock[0]))
+    restarted = Engine(store, engine.client, engine.health, engine.log, clock=engine.clock)
+    await restarted.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/start"]
+    assert await store.get("delivery", scope="member:0") is None
+
+
+async def test_stop_without_duration_runs_watching_cleanup_immediately(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
+        return httpx.Response(201, json={})
+
+    engine, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
+    await engine.accept("started", event, "start", started)
+    await engine.drain(0)
+    ledger = await engine.ledger(0)
+    live = ledger["live_watching"]
+    live["ack_at"] = live.pop("window_end") - 1
+    await engine.save_ledger(0, ledger)
+    clock[0] += 10
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+
+
+async def test_stop_without_duration_cancels_start_that_is_still_queued(harness, event):
+    engine, store, clock, requests = await harness()
+    await engine.accept("started", event, "start", iso_time(clock[0]))
+    clock[0] += 5
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert not requests
+    assert not await store.get("delivery", scope="member:0")
+
+
+@pytest.mark.parametrize("action, offset", [("checkin", 0), ("scrobble", 30)])
+async def test_stop_without_duration_does_not_pause_a_different_trakt_session(
+    harness, event, action, offset
+):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": action,
+                    "started_at": iso_time(started + offset),
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return httpx.Response(201, json={"action": "start"})
+
+    engine, _, clock, requests = await harness(handler)
+    started = clock[0]
+    await engine.accept("started", event, "start", iso_time(started))
+    await engine.drain(0)
+    clock[0] += 60
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/start", "/users/me/watching"]
+
+
+async def test_movement_without_an_initial_start_opens_a_single_scrobble(harness, event):
+    engine, _, clock, requests = await harness(
+        lambda r: httpx.Response(204) if r.url.path == "/users/me/watching" else None
+    )
+    for offset, position in enumerate((10_000, 10_000, 20_000, 30_000)):
+        clock[0] += 30
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+        if offset < 3:
+            assert not requests
+    assert [r.url.path for r in requests if r.method == "POST"] == ["/scrobble/start"]
+    assert json.loads(requests[-1].content)["progress"] == 30
+
+
+async def test_seek_only_does_not_infer_a_playback_start(harness, event):
+    engine, _, clock, requests = await harness()
+    for offset, position in enumerate((0, 80_000, 95_000)):
+        clock[0] += 1
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"seek-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    assert not requests
+
+
+@pytest.mark.parametrize("prior_stop", [False, True])
+async def test_missing_start_recovers_after_an_abandoned_title_or_same_title_stop(
+    harness, event, prior_stop
+):
+    engine, _, clock, requests = await harness(
+        lambda r: httpx.Response(204) if r.url.path == "/users/me/watching" else None
+    )
+    await engine.accept("started", event, "old-start", iso_time(clock[0]))
+    await engine.drain(0)
+    if prior_stop:
+        clock[0] += 2
+        await engine.accept(
+            "stopped", {**event, "position_ms": 20000}, "old-stop", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    else:
+        event = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    assert [r.url.path for r in requests if r.method == "POST"] == (
+        ["/scrobble/start", "/scrobble/stop", "/scrobble/start"]
+        if prior_stop
+        else ["/scrobble/start", "/scrobble/start"]
+    )
+
+
+async def test_durable_start_can_arrive_after_progress_following_a_stop(harness, event):
+    engine, _, clock, requests = await harness()
+    await engine.accept("stopped", {**event, "position_ms": 20000}, "old-stop", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 60
+    await engine.accept("progress", {**event, "position_ms": 30000}, "progress", iso_time(clock[0]))
+    await engine.accept("started", event, "delayed-start", iso_time(clock[0] - 20))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/stop", "/scrobble/start"]
+
+
+async def test_inferred_start_does_not_replace_currently_watching_on_another_device(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(200, json={"action": "scrobble", "movie": {"ids": {"tmdb": 22}}})
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching"]
+
+
+async def test_guarded_inference_still_records_a_rewatch_when_another_title_is_active(
+    harness, event
+):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(200, json={"action": "scrobble", "movie": {"ids": {"tmdb": 22}}})
+        if request.method == "GET" and request.url.path == "/sync/history/movies":
+            return httpx.Response(200, json=[])
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    await engine.accept("completed", event, "previous-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+        await engine.drain(0)
+    clock[0] += 20
+    await engine.accept("completed", event, "rewatch-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/stop",
+        "/users/me/watching",
+        "/sync/history/movies",
+        "/sync/history",
+    ]
+
+
+async def test_watching_lookup_outage_does_not_delay_another_completion(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(503)
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+    other = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    await engine.accept("completed", other, "other-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 1
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching", "/scrobble/stop"]
+
+
+async def test_watching_rate_limit_also_delays_other_queued_writes(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(429, headers={"Retry-After": "300"})
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+    other = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    await engine.accept("completed", other, "other-completion", iso_time(clock[0]))
+    await engine.drain(0)
+    clock[0] += 299
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching"]
+    clock[0] += 2
+    await engine.drain(0)
+    assert [r.url.path for r in requests][1:] == ["/sync/history/movies", "/sync/history"]
+
+
+async def test_lost_start_response_can_still_clear_watching_on_a_real_stop(harness, event):
+    def handler(request):
+        if request.url.path == "/scrobble/start":
+            raise httpx.ReadError("lost start response", request=request)
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": "scrobble",
+                    "started_at": started,
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
+    await engine.accept("started", event, "start", started)
+    await engine.drain(0)
+    clock[0] += 5
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+
+
+async def test_slow_watching_lookup_never_sends_an_expired_start(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            clock[0] += 301
+            return httpx.Response(204)
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    for offset, position in enumerate((10_000, 30_000, 50_000)):
+        clock[0] += 20
+        await engine.accept(
+            "progress", {**event, "position_ms": position}, f"tick-{offset}", iso_time(clock[0])
+        )
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/users/me/watching"]
+
+
+@pytest.mark.parametrize("new_start", [False, True])
+async def test_watching_cleanup_failure_does_not_block_a_completed_viewing(
+    harness, event, new_start
+):
+    lookups = 0
+
+    def handler(request):
+        nonlocal lookups
+        if request.url.path == "/scrobble/start":
+            raise httpx.ReadError("lost start response", request=request)
+        if request.url.path == "/users/me/watching":
+            lookups += 1
+            if lookups == 1:
+                return httpx.Response(503)
+            return httpx.Response(
+                200,
+                json={
+                    "action": "scrobble",
+                    "started_at": iso_time(started + (10 if new_start else 0)),
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        if request.method == "GET" and request.url.path == "/sync/history/movies":
+            return httpx.Response(200, json=[])
+        return None
+
+    engine, store, clock, requests = await harness(handler)
+    payload = {**event, "viewing_id": "same-session"}
+    started = clock[0]
+    await engine.accept("started", payload, "start", iso_time(started))
+    await engine.drain(0)
+    clock[0] += 5
+    await engine.accept("completed", payload, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/sync/history/movies",
+        "/users/me/watching",
+        "/sync/history",
+    ]
+    assert (await store.get("delivery", scope="member:0"))["next_at"] == clock[0] + 60
+    clock[0] += 60
+    await engine.drain(0)
+    if new_start:
+        assert requests[-1].url.path == "/users/me/watching"
+        assert not any(r.url.path == "/scrobble/pause" for r in requests)
+    else:
+        assert [r.url.path for r in requests[-2:]] == ["/users/me/watching", "/scrobble/pause"]
+    assert await store.get("delivery", scope="member:0") is None
+
+
+async def test_legacy_watching_without_recorded_bounds_is_not_cleared(harness, event):
+    engine, _, clock, requests = await harness()
+    await engine.accept("started", event, "start", iso_time(clock[0]))
+    await engine.drain(0)
+    ledger = await engine.ledger(0)
+    ledger["live_watching"].pop("window_end")
+    ledger["live_watching"].pop("ack_at")
+    await engine.save_ledger(0, ledger)
+    clock[0] += 5
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == ["/scrobble/start"]
+
+
+async def test_stop_clears_a_start_committed_in_flight_after_the_player_stopped(harness, event):
+    def handler(request):
+        if request.url.path == "/scrobble/start":
+            clock[0] += 10
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={
+                    "action": "scrobble",
+                    "started_at": iso_time(started + 8),
+                    "movie": {"ids": {"tmdb": 11}},
+                },
+            )
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    started = clock[0]
+    await engine.accept("started", event, "start", iso_time(started))
+    await engine.drain(0)
+    await engine.accept("stopped", {**event, "duration_ms": None}, "stop", iso_time(started + 5))
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+
+
+async def test_watching_is_off_by_default_but_completed_watches_still_sync(harness, event):
+    engine, _, clock, requests = await harness(report_watching=False)
+    for index, position in enumerate((0, 20_000, 40_000, 60_000)):
+        await engine.accept(
+            "started" if index == 0 else "progress",
+            {**event, "position_ms": position},
+            f"play-{index}",
+            iso_time(clock[0]),
+        )
+        await engine.drain(0)
+        clock[0] += 20
+    assert not requests
+    await engine.accept("completed", event, "complete", iso_time(clock[0]))
+    await engine.drain(0)
+    assert [(r.method, r.url.path) for r in requests] == [
+        ("GET", "/sync/history/movies"),
+        ("POST", "/sync/history"),
+    ]
+    assert json.loads(requests[-1].content)["movies"][0]["watched_at"] == iso_time(
+        clock[0] // 60 * 60
+    )
+
+
+async def test_turning_watching_off_cancels_queued_start_and_clears_owned_status(harness, event):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
+        return None
+
+    engine, _, clock, requests = await harness(handler)
+    started = iso_time(clock[0])
+    await engine.accept("started", event, "started", started)
+    await engine.drain(0)
+    clock[0] += 20
+    other = {**event, "media": {**event["media"], "id": 8, "tmdb_id": 22}}
+    await engine.accept("started", other, "queued", iso_time(clock[0]))
+    async with engine.locks[0]:
+        await engine.set(0, "report_watching", False)
+        await engine.disable_watching(0)
+    await engine.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+    assert json.loads(requests[-1].content)["progress"] == 90
+    clock[0] += 20
+    await engine.accept("completed", other, "complete", iso_time(clock[0]))
+    await engine.drain(0)
+    assert requests[-1].url.path == "/sync/history"
+
+
+async def test_default_off_upgrade_clears_the_acknowledged_start_after_an_uncertain_retry(
+    harness, event
+):
+    def handler(request):
+        if request.url.path == "/users/me/watching":
+            return httpx.Response(
+                200,
+                json={"started_at": started, "action": "scrobble", "movie": {"ids": {"tmdb": 11}}},
+            )
+        if request.url.path == "/scrobble/start" and clock[0] > start_time:
+            raise httpx.ReadError("fixture lost start", request=request)
+        return None
+
+    engine, store, clock, requests = await harness(handler)
+    start_time = clock[0]
+    started = iso_time(start_time)
+    await engine.accept("started", event, "first", started)
+    await engine.drain(0)
+    clock[0] += 20
+    await engine.accept("started", event, "second", iso_time(clock[0]))
+    await engine.drain(0)
+    await store.delete("report_watching", scope="member:0")
+    await store.set("delivery-index-v3", True)
+
+    restarted = Engine(store, engine.client, engine.health, engine.log, clock=engine.clock)
+    await restarted.initialize()
+    await restarted.drain(0)
+    await restarted.drain(0)
+    assert [r.url.path for r in requests] == [
+        "/scrobble/start",
+        "/scrobble/start",
+        "/users/me/watching",
+        "/users/me/watching",
+        "/scrobble/pause",
+    ]
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_opt_out_preserves_only_unexpired_cleanup_for_the_same_start(harness, event, expired):
+    engine, _, clock, _ = await harness()
+    await engine.accept("started", {**event, "position_ms": 20_000}, "start", iso_time(clock[0]))
+    await engine.drain(0)
+    ledger = await engine.ledger(0)
+    live = ledger["live_watching"]
+    completion_cleanup = {
+        "live": live,
+        "stopped_at": clock[0],
+        "next_at": clock[0] + 60,
+        "expires_at": clock[0] + 300,
+    }
+    ledger["watching_cleanups"] = {live["key"]: completion_cleanup}
+    await engine.save_ledger(0, ledger)
+    if expired:
+        clock[0] += 301
+    async with engine.locks[0]:
+        await engine.set(0, "report_watching", False)
+        await engine.disable_watching(0)
+    pending = (await engine.ledger(0))["watching_cleanups"]
+    if expired:
+        cleanup = next(iter(pending.values()))
+        assert len(pending) == 1
+        assert cleanup["live"] == live and cleanup["next_at"] == clock[0]
+    else:
+        assert pending == {live["key"]: completion_cleanup}
+
+
+async def test_watching_upgrade_recovers_other_members_if_one_ledger_write_fails(
+    harness, event, monkeypatch
+):
+    engine, store, clock, _ = await harness()
+    await engine.accept("started", event, "start", iso_time(clock[0]))
+    await engine.drain(0)
+    await store.delete("report_watching", scope="member:0")
+    await store.set("delivery-index-v3", True)
+    await engine.set(2, "ledger", await engine.ledger(0))
+    set_value = store.set
+
+    async def fail_one_ledger(key, value, *, scope="global", secret=False):
+        if (scope, key) == ("member:0", "ledger"):
+            raise OSError("fixture storage failure")
+        await set_value(key, value, scope=scope, secret=secret)
+
+    monkeypatch.setattr(store, "set", fail_one_ledger)
+    await engine.initialize()
+    assert not (await engine.ledger(0)).get("watching_cleanups")
+    assert (await engine.ledger(2))["watching_cleanups"]
+    assert (await store.get("watching-opt-in-v1"))["members"] == [0]
+    monkeypatch.setattr(store, "set", set_value)
+    clock[0] += 60
+    await engine.initialize()
+    assert (await engine.ledger(0))["watching_cleanups"]
+    assert await store.get("watching-opt-in-v1") is True

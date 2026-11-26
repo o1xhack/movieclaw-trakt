@@ -8,7 +8,22 @@ class Preferences(BaseModel):
     manual_watched: bool = False
     manual_unwatched: bool = False
     favorites: bool = False
+    automatic_import: bool = False
+    report_watching: bool = False
 
 
 async def preferences(engine, member):
-    return Preferences.model_validate(await engine.get(member, "profile", {}))
+    profile = await engine.get(member, "profile", {})
+    binding = await engine.get(member, "automatic_import_binding", {})
+    try:
+        account = await engine.get(member, "account", {}) if binding else {}
+    except ValueError:
+        account = {}
+    current = bool(account.get("generation")) and binding.get("generation") == account["generation"]
+    return Preferences.model_validate(
+        {
+            **profile,
+            "automatic_import": current,
+            "report_watching": await engine.get(member, "report_watching", False),
+        }
+    )

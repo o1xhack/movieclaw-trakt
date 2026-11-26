@@ -41,6 +41,7 @@ class Engine(ActivityLog, Recovery):
         self.wake = asyncio.Event()
         self.bootstrap = asyncio.Lock()
         self.delivery_failures = {}
+        self.watching_migration_due = None
 
     @staticmethod
     def scope(member):
@@ -130,6 +131,23 @@ class Engine(ActivityLog, Recovery):
     def source_ids(values):
         values = [values] if isinstance(values, str) else values or []
         return tuple(dict.fromkeys(v for v in values if isinstance(v, str) and 0 < len(v) <= 200))
+
+    @staticmethod
+    def scrobble_key(account_identity, remote_id):
+        return (
+            "outbound_scrobble_"
+            + hashlib.sha256(json.dumps([account_identity, remote_id]).encode()).hexdigest()
+        )
+
+    async def outbound_scrobble(self, member, account, remote_id, item):
+        # A scrobble history ID represents one particular viewing, independent of minute
+        # boundaries or other rewatches of the same movie or episode.
+        identities = {account["generation"], account.get("user_uuid")} - {None}
+        for account_identity in identities:
+            delivered = await self.get(member, self.scrobble_key(account_identity, remote_id))
+            if delivered and matches(item, delivered):
+                return True
+        return False
 
     async def source_delivery(self, member, generation, item, source_ids, *, details=False):
         selected = None
@@ -241,11 +259,16 @@ class Engine(ActivityLog, Recovery):
     async def save_ledger(self, member, ledger):
         # 宿主的可靠消费者跨成员共享。容量不足必须显式降级，不能靠抛错阻塞所有成员。
         queue = ledger["queue"]
+        ledger.pop("watching", None)  # Older releases set this before Trakt acknowledged a start.
         queue[:] = [
             j
             for j in queue
             if self.finished(j) or self.clock() - timestamp(j["occurred_at"]) <= 300
         ]
+        queued = {job["id"] for job in queue}
+        for playback in ledger["sessions"].values():
+            if playback.get("inferred_start") not in queued:
+                playback.pop("inferred_start", None)
         ledger["seen"] = ledger["seen"][-256:]
         ledger["sessions"] = dict(list(ledger["sessions"].items())[-16:])
         if ledger.get("last_error"):
@@ -282,8 +305,14 @@ class Engine(ActivityLog, Recovery):
             if queue
             else [j["retry_at"] for j in ledger.get("failed", []) if "retry_at" in j]
         )
+        for cleanup in ledger.get("watching_cleanups", {}).values():
+            deadlines.append(cleanup["next_at"])
         if deadlines:
-            await self.set(member, "delivery", {"next_at": min(deadlines)})
+            await self.set(
+                member,
+                "delivery",
+                {"next_at": max(min(deadlines), ledger.get("requests_not_before", 0))},
+            )
         await self.set(member, "ledger", ledger)
         if not deadlines:
             await self.store.delete("delivery", scope=self.scope(member))
@@ -292,6 +321,9 @@ class Engine(ActivityLog, Recovery):
     async def block_auth(self, member, account, ledger):
         current = await self.get(member, "account", account)
         await self.set(member, "account", {**current, "blocked": True}, secret=True)
+        ledger.pop("live_watching", None)
+        ledger.pop("unconfirmed_start", None)
+        ledger.pop("watching_cleanups", None)
         ledger.update(
             queue=[],
             failed=[],
@@ -308,9 +340,49 @@ class Engine(ActivityLog, Recovery):
     async def initialize(self):
         # scopes(account) 会一次解密全部账号。先从明文 ledger/linked 找出成员，再逐个读凭据。
         async with self.bootstrap:
-            if await self.store.get("delivery-index-v3", default=False):
+            indexed = await self.store.get("delivery-index-v3", default=False)
+            watching_migration = await self.store.get("watching-opt-in-v1", default=False)
+            self.watching_migration_due = (
+                watching_migration["retry_at"] if isinstance(watching_migration, dict) else None
+            )
+            migrate_watching = watching_migration is not True and (
+                self.watching_migration_due is None or self.watching_migration_due <= self.clock()
+            )
+            if indexed and not migrate_watching:
                 return
-            ledgers = await self.store.scopes("ledger", entity="member")
+            ledgers = (
+                await self.store.scopes("ledger", entity="member")
+                if not indexed or not watching_migration
+                else {}
+            )
+            if migrate_watching:
+                if isinstance(watching_migration, dict):
+                    members = watching_migration["members"]
+                else:
+                    members = [
+                        int(scope.split(":", 1)[1])
+                        for scope, ledger in ledgers.items()
+                        if scope.split(":", 1)[-1].isdigit()
+                        and (ledger.get("live_watching") or ledger.get("unconfirmed_start"))
+                    ]
+                retry = []
+                for member in members:
+                    try:
+                        async with self.locks[member]:
+                            if not await self.get(member, "report_watching", False):
+                                await self.disable_watching(member)
+                    except Exception as exc:
+                        retry.append(member)
+                        self.log.warning(
+                            "Trakt 单个成员的正在观看状态无法清理（%s）", type(exc).__name__
+                        )
+                self.watching_migration_due = self.clock() + 60 if retry else None
+                await self.store.set(
+                    "watching-opt-in-v1",
+                    {"members": retry, "retry_at": self.watching_migration_due} if retry else True,
+                )
+            if indexed:
+                return
             linked = await self.store.scopes("linked", entity="member")
             scopes = set(ledgers) | set(linked) | {self.scope(0)}
             for scope in scopes:
@@ -596,9 +668,13 @@ class Engine(ActivityLog, Recovery):
                 "pending",
                 "ledger",
                 "activity",
+                "import_activity",
+                "import_activity_backfill",
                 "linked",
                 "delivery",
                 "storage_error",
+                "automatic_import_binding",
+                "report_watching",
             ):
                 await self.store.delete(key, scope=self.scope(member))
             self.rotated.pop(member, None)
@@ -627,6 +703,33 @@ class Engine(ActivityLog, Recovery):
             await self.health.ok(f"member-{member}")
             return {"disconnected": True, "remote_revocation_confirmed": revoked}
 
+    async def disable_watching(self, member):
+        """The caller holds the member lock and has saved the preference."""
+        ledger = await self.ledger(member)
+        ledger["queue"][:] = [job for job in ledger["queue"] if job["path"] != "/scrobble/start"]
+        now = self.clock()
+        cleanups = {
+            key: cleanup
+            for key, cleanup in ledger.get("watching_cleanups", {}).items()
+            if cleanup["expires_at"] >= now
+        }
+        ledger["watching_cleanups"] = cleanups
+        for marker in ("unconfirmed_start", "live_watching"):
+            live = ledger.get(marker)
+            if not live or any(
+                entry["live"]["key"] == live["key"] and entry["live"]["sent_at"] == live["sent_at"]
+                for entry in cleanups.values()
+            ):
+                continue
+            cleanups[f"{live['key']}:{live['sent_at']}"] = {
+                "live": live,
+                "stopped_at": now,
+                "next_at": now,
+                "expires_at": now + 300,
+                "progress": live["progress"],
+            }
+        await self.save_ledger(member, ledger)
+
     async def accept(self, kind, event, event_id, occurred_at):
         member = event.get("member_id")
         if not self.enabled or not isinstance(member, int) or member < 0:
@@ -653,6 +756,7 @@ class Engine(ActivityLog, Recovery):
                 return
             if event_id in ledger["seen"]:
                 return
+            report_watching = await self.get(member, "report_watching", False)
             item, rate = identity(event), progress(event)
             completed = kind == "completed" or (
                 kind == "stopped" and event.get("completed") is True
@@ -690,38 +794,107 @@ class Engine(ActivityLog, Recovery):
                             "body": history_body(item, occurred_at),
                         }
                         if local_completion:
-                            request["clear_watching"] = not stale and ledger.get("watching") == key
+                            request["clear_watching"] = not stale and bool(
+                                self.watching_for(ledger, key)
+                            )
                             state["closed"] = True
                             state["at"] = at
                         state["terminal_at"] = at
             elif item and at >= state.get("at", 0):
                 if kind == "started":
-                    state = {"session": event_id, "at": at, "last_start": at}
+                    state = {"session": event_id, "at": at}
                     request = {
                         "path": "/scrobble/start",
                         "body": {**item, "progress": rate or 0},
                     }
+                elif kind == "progress" and rate is not None:
+                    live = ledger.get("live_watching", {})
+                    position = event["position_ms"]
+                    elapsed = at - state.get("sample_at", at)
+                    traveled = position - state.get("sample_position", position)
+                    if elapsed < 0:
+                        return
+                    state.update(sample_at=at, sample_position=position)
+                    if live.get("key") == key:
+                        live["progress"] = rate
+                    elif not any(
+                        job["key"] == key and job["path"] == "/scrobble/start"
+                        for job in ledger["queue"]
+                    ):
+                        # A seek can move the position without playback. Require two
+                        # consecutive advances at a plausible rate before inferring a start.
+                        moving = 5 <= elapsed <= 150 and 250 * elapsed <= traveled <= 4000 * elapsed
+                        state["moving_reports"] = (
+                            state.get("moving_reports", 0) + 1 if moving else 0
+                        )
+                        if state["moving_reports"] >= 2:
+                            # Movement reopens local playback even if Trakt has an active
+                            # session from another device and we cannot send this start.
+                            state.pop("closed", None)
+                            state.pop("terminal_at", None)
+                            state.pop("session", None)
+                            state["inferred_only"] = True
+                            if report_watching and at >= state.get("retry_inferred_at", 0):
+                                state["inferred_start"] = event_id
+                                request = {
+                                    "path": "/scrobble/start",
+                                    "body": {**item, "progress": rate},
+                                    "inferred": True,
+                                }
                 elif not state.get("closed") or (completed and "terminal_at" not in state):
                     state["at"] = at
-                    if kind in ("stopped", "completed") and rate is not None:
+                    live = self.watching_for(ledger, key)
+                    if kind in ("stopped", "completed"):
                         state["closed"] = True
-                        if rate > 80:
+                        state.pop("sample_at", None)
+                        state.pop("sample_position", None)
+                        state.pop("moving_reports", None)
+                        if rate is not None and rate > 80:
                             state["terminal_at"] = at
-                        request = {
-                            "path": "/scrobble/stop",
-                            "body": {**item, "progress": rate},
-                        }
-                    elif kind == "progress" and rate is not None:
-                        if at - state.get("last_start", 0) >= 60:
-                            state["last_start"] = at
+                        if (
+                            state.get("inferred_only")
+                            and ledger.get("live_watching", {}).get("key") != key
+                        ):
+                            if rate is not None and rate > 80:
+                                request = {
+                                    "path": "/sync/history",
+                                    "body": history_body(item, occurred_at),
+                                    "clear_watching": bool(live),
+                                }
+                            elif live:
+                                request = {
+                                    "path": "/scrobble/pause",
+                                    "body": {
+                                        **item,
+                                        "progress": rate if rate is not None else live["progress"],
+                                    },
+                                }
+                        elif rate is not None:
                             request = {
-                                "path": "/scrobble/start",
+                                "path": "/scrobble/stop",
                                 "body": {**item, "progress": rate},
                             }
+                        elif live:
+                            # A real stop with unknown duration can still clear our own start.
+                            request = {
+                                "path": "/scrobble/pause",
+                                "body": {**item, "progress": live["progress"]},
+                            }
+            if request and not report_watching:
+                if request["path"] == "/scrobble/stop" and self.finished(request):
+                    request = {"path": "/sync/history", "body": history_body(item, occurred_at)}
+                elif request["path"] in {"/scrobble/start", "/scrobble/stop", "/scrobble/pause"}:
+                    request = None
+            if item and kind in {"stopped", "completed"} and at >= state.get("at", 0):
+                state.pop("inferred_start", None)
+                ledger["queue"] = [
+                    job
+                    for job in ledger["queue"]
+                    if not (job["key"] == key and job["path"] == "/scrobble/start")
+                ]
             if request:
-                # 同一播放尚未发出的心跳只保留最新一条；停止事件不会被它覆盖。
+                # 同一播放尚未发出的开始请求只保留最新一条。
                 if request["path"] == "/scrobble/start":
-                    ledger["watching"] = key
                     ledger["queue"] = [
                         j
                         for j in ledger["queue"]
@@ -749,7 +922,10 @@ class Engine(ActivityLog, Recovery):
             ledger["sessions"] = dict(
                 sorted(
                     ledger["sessions"].items(),
-                    key=lambda pair: pair[1].get("at", pair[1].get("terminal_at", 0)),
+                    key=lambda pair: max(
+                        pair[1].get("at", pair[1].get("terminal_at", 0)),
+                        pair[1].get("sample_at", 0),
+                    ),
                 )[-16:]
             )
             ledger["seen"] = [*ledger["seen"], event_id][-256:]
@@ -819,15 +995,22 @@ class Engine(ActivityLog, Recovery):
         return updated
 
     async def history_exists(self, member, account, job):
+        found, _ = await self.find_delivered_history(member, account, job)
+        return found
+
+    async def find_delivered_history(self, member, account, job):
         when = trakt_minute(job.get("history_at", job["occurred_at"]))
         end = when
         window = job.get("scrobble_window")
-        if window and window["item"] == job["item"]:
+        native_window = window and window["item"] == job["item"]
+        if native_window:
             # Native scrobbles receive a server time, unlike explicit history writes.
             when, end = trakt_minute(window["start"]), trakt_minute(window["end"])
         kind = "movies" if "movie" in job["item"] else "episodes"
         page = 1
         previous = None
+        found = False
+        confirmed_id = None
         while True:
             rows = await self.authorized(
                 member,
@@ -843,9 +1026,18 @@ class Engine(ActivityLog, Recovery):
             )
             for row in rows:
                 if matches(job["item"], row) and when <= trakt_minute(row["watched_at"]) <= end:
-                    return True
+                    if not native_window:
+                        return True, None
+                    remote_id = row.get("id")
+                    if found and (confirmed_id is None or remote_id != confirmed_id):
+                        # A history match is enough to avoid a second outgoing write. It
+                        # cannot identify which of several matches was this scrobble.
+                        return True, None
+                    found = True
+                    if row.get("action") == "scrobble" and type(remote_id) is int and remote_id > 0:
+                        confirmed_id = remote_id
             if not rows or (getattr(rows, "page_count", 0) and page >= rows.page_count):
-                return False
+                return found, confirmed_id
             signature = json.dumps(rows, sort_keys=True)
             if signature == previous:
                 raise TraktError(502)
@@ -893,6 +1085,152 @@ class Engine(ActivityLog, Recovery):
             if window := job.get("scrobble_window"):
                 window["end"] = iso_time(max(timestamp(window["start"]), self.clock()))
 
+    async def deliver_start(self, member, account, ledger, job):
+        if not job.get("inferred"):
+            return await self.start_watching(member, account, ledger, job)
+        state = ledger["sessions"].get(job["key"], {})
+        if state.get("inferred_start") != job["id"]:
+            return {"action": "expired"}
+        try:
+            current = await self.authorized(member, account, "GET", "/users/me/watching")
+            if not current:
+                result = await self.start_watching(member, account, ledger, job)
+                ledger["sessions"][job["key"]] = {
+                    "session": job["id"],
+                    "at": timestamp(job["occurred_at"]),
+                }
+                return result
+            retry_after = 60
+        except TraktError as exc:
+            if exc.auth_error:
+                raise
+            # An optional start must not delay a real stop or viewing record in the queue.
+            retry_after = max(60, exc.retry_after)
+            if exc.status == 429:
+                ledger["requests_not_before"] = self.clock() + exc.retry_after
+        state.pop("inferred_start", None)
+        state["moving_reports"] = 0
+        state["retry_inferred_at"] = self.clock() + retry_after
+        return {"action": "expired"}
+
+    @staticmethod
+    def watching_for(ledger, key):
+        for marker in ("unconfirmed_start", "live_watching"):
+            live = ledger.get(marker, {})
+            if live.get("key") == key:
+                return live
+        return {}
+
+    async def start_watching(self, member, account, ledger, job):
+        previous = ledger.get("unconfirmed_start")
+
+        async def before_send():
+            now = self.clock()
+            if now - timestamp(job["occurred_at"]) > 300:
+                await self.save_inflight(member, ledger, job)
+            ledger["unconfirmed_start"] = {
+                "key": job["key"],
+                "item": job["item"],
+                "sent_at": now,
+                "window_end": now + 15,
+                "progress": job["body"]["progress"],
+            }
+            await self.save_inflight(member, ledger, job)
+
+        async def clear_rejected():
+            if previous:
+                ledger["unconfirmed_start"] = previous
+            else:
+                ledger.pop("unconfirmed_start", None)
+            await self.save_ledger(member, ledger)
+
+        try:
+            result = await self.authorized(
+                member,
+                account,
+                "POST",
+                job["path"],
+                job["body"],
+                before_send=before_send,
+                after_rejection=clear_rejected,
+            )
+        except TraktError as exc:
+            if not exc.uncertain:
+                await clear_rejected()
+            raise
+        live = ledger.pop("unconfirmed_start")
+        live["ack_at"] = self.clock()
+        live["window_end"] = live["ack_at"] + 1
+        ledger["live_watching"] = live
+        return result
+
+    async def pause_owned_watching(self, member, account, live, stopped_at):
+        end = live.get("window_end")
+        if end is None:
+            acknowledged = live.get("ack_at")
+            if acknowledged is None:
+                return
+            end = acknowledged + 1
+        current = await self.authorized(member, account, "GET", "/users/me/watching")
+        if not isinstance(current, dict):
+            raise TraktError(502)
+        started = current.get("started_at")
+        if not started or current.get("action") != "scrobble" or not matches(live["item"], current):
+            return
+        try:
+            started_at = timestamp(started)
+        except (AttributeError, TypeError, ValueError):
+            return
+        acknowledged = live.get("ack_at", stopped_at)
+        if live["sent_at"] <= stopped_at and int(live["sent_at"]) <= started_at <= min(
+            end, max(stopped_at, acknowledged)
+        ):
+            await self.authorized(
+                member,
+                account,
+                "POST",
+                "/scrobble/pause",
+                {**live["item"], "progress": live["progress"]},
+            )
+
+    async def retry_watching_cleanup(self, member, account, ledger, cleanup_id, cleanup):
+        live = cleanup["live"]
+        pending = ledger["watching_cleanups"]
+        current = ledger.get("live_watching")
+        superseded = (
+            current
+            and current["sent_at"] > live["sent_at"]
+            and matches(live["item"], current["item"])
+        )
+        if superseded or self.clock() > cleanup["expires_at"]:
+            pending.pop(cleanup_id, None)
+        else:
+            try:
+                await self.pause_owned_watching(
+                    member,
+                    account,
+                    {**live, "progress": cleanup.get("progress", 100)},
+                    cleanup["stopped_at"],
+                )
+            except TraktError as exc:
+                if exc.auth_error:
+                    await self.block_auth(member, account, ledger)
+                    return
+                cleanup["next_at"] = self.clock() + max(60, exc.retry_after)
+                if exc.status == 429:
+                    ledger["requests_not_before"] = cleanup["next_at"]
+            else:
+                pending.pop(cleanup_id, None)
+                self.clear_watching_markers(ledger, live["key"], live["sent_at"])
+        await self.save_ledger(member, ledger)
+
+    @staticmethod
+    def clear_watching_markers(ledger, key, sent_at=None):
+        for marker in ("live_watching", "unconfirmed_start"):
+            live = ledger.get(marker, {})
+            if live.get("key") == key and (sent_at is None or live["sent_at"] == sent_at):
+                ledger.pop(marker)
+
     async def drain(self, member):
         async with self.locks[member]:
             account = await self.get(member, "account", {})
@@ -906,6 +1244,20 @@ class Engine(ActivityLog, Recovery):
                 return
             await self.store.delete("storage_error", scope=self.scope(member))
             ledger = await self.ledger(member)
+            if self.clock() < ledger.get("requests_not_before", 0):
+                return
+            cleanup = min(
+                ledger.get("watching_cleanups", {}).items(),
+                key=lambda entry: entry[1]["next_at"],
+                default=None,
+            )
+            if (
+                cleanup
+                and cleanup[1]["next_at"] <= self.clock()
+                and (not ledger["queue"] or ledger["queue"][0]["next_at"] > self.clock())
+            ):
+                await self.retry_watching_cleanup(member, account, ledger, *cleanup)
+                return
             if not ledger["queue"]:
                 await self._retry_locked(member, automatic=True)
                 ledger = await self.ledger(member)
@@ -918,6 +1270,17 @@ class Engine(ActivityLog, Recovery):
                 ledger["queue"][:] = [j for j in ledger["queue"] if j["id"] != job["id"]]
                 await self.save_ledger(member, ledger)
                 return
+            if not await self.get(member, "report_watching", False):
+                if job["path"] == "/scrobble/start" or (
+                    job["path"] == "/scrobble/stop" and not self.finished(job)
+                ):
+                    ledger["queue"].pop(0)
+                    await self.save_ledger(member, ledger)
+                    await self.complete_activity(member, job, "expired")
+                    return
+                if job["path"] == "/scrobble/stop" and not job["uncertain"]:
+                    job["path"] = "/sync/history"
+                    job["body"] = history_body(job["item"], job["occurred_at"])
             try:
                 if job.get("source") and (job.get("attempt") or job.get("repair_attempt")):
                     job["revalidate"] = True
@@ -974,30 +1337,39 @@ class Engine(ActivityLog, Recovery):
                         if not any(j["id"] == job["id"] for j in ledger["queue"]):
                             return
                     if finished and (job["path"] == "/sync/history" or uncertain or late):
-                        if await self.history_exists(member, account, job):
+                        existing, recovered_id = await self.find_delivered_history(
+                            member, account, job
+                        )
+                        if existing:
                             result = {
                                 "action": "minute_merged"
                                 if job.get("export_collision")
                                 else "already_synced"
                             }
+                            if recovered_id is not None:
+                                result["scrobble_history_id"] = recovered_id
                         else:
-                            if (
-                                job.get("clear_watching")
-                                and not late
-                                and ledger.get("watching") == job["key"]
-                            ):
-                                watching = await self.authorized(
-                                    member, account, "GET", "/users/me/watching"
-                                )
-                                if matches(job["item"], watching):
-                                    # pause 不生成已看历史；再用原观看时间写唯一一条历史。
-                                    await self.authorized(
+                            live = self.watching_for(ledger, job["key"])
+                            if job.get("clear_watching") and not late and live:
+                                try:
+                                    await self.pause_owned_watching(
                                         member,
                                         account,
-                                        "POST",
-                                        "/scrobble/pause",
-                                        {**job["item"], "progress": 100},
+                                        {**live, "progress": 100},
+                                        timestamp(job["occurred_at"]),
                                     )
+                                except TraktError as exc:
+                                    if exc.auth_error or exc.status == 429:
+                                        raise
+                                    pending_cleanup = ledger.setdefault("watching_cleanups", {})
+                                    pending_cleanup[job["key"]] = {
+                                        "live": live,
+                                        "stopped_at": timestamp(job["occurred_at"]),
+                                        "next_at": self.clock() + max(60, exc.retry_after),
+                                        "expires_at": self.clock() + 300,
+                                    }
+                                else:
+                                    self.clear_watching_markers(ledger, job["key"])
                             # Persist the change of write contract before POST. If this
                             # response is lost too, reconcile its explicit source minute.
                             job.pop("scrobble_window", None)
@@ -1015,6 +1387,18 @@ class Engine(ActivityLog, Recovery):
                             )
                     elif finished and job["path"] == "/scrobble/stop":
                         result = await self.native_stop(member, account, ledger, job)
+                    elif job["path"] == "/scrobble/start":
+                        result = await self.deliver_start(member, account, ledger, job)
+                    elif job["path"] == "/scrobble/pause":
+                        live = self.watching_for(ledger, job["key"])
+                        if live:
+                            await self.pause_owned_watching(
+                                member,
+                                account,
+                                {**live, "progress": job["body"]["progress"]},
+                                timestamp(job["occurred_at"]),
+                            )
+                        result = {"action": "pause"}
                     else:
                         result = await self.authorized(
                             member, account, "POST", job["path"], job["body"]
@@ -1081,6 +1465,14 @@ class Engine(ActivityLog, Recovery):
                 "local_deleted",
                 "manual_unwatched",
             }:
+                remote_id = (
+                    result.get("id")
+                    if job["path"] == "/scrobble/stop" and result.get("action") == "scrobble"
+                    else result.get("scrobble_history_id")
+                )
+                if type(remote_id) is int and remote_id > 0:
+                    owner = account.get("user_uuid") or account["generation"]
+                    await self.set(member, self.scrobble_key(owner, remote_id), job["item"])
                 watched_at = job["occurred_at"]
                 if delivered and delivered.get("export"):
                     watched_at = max(watched_at, delivered["export"]["watched_at"], key=timestamp)
@@ -1106,8 +1498,10 @@ class Engine(ActivityLog, Recovery):
             ledger["queue"][:] = [j for j in ledger["queue"] if j["id"] != job["id"]]
             if ledger["queue"]:
                 ledger["queue"][0]["next_at"] = max(ledger["queue"][0]["next_at"], self.clock() + 1)
-            if job["path"] != "/scrobble/start" and ledger.get("watching") == job["key"]:
-                ledger.pop("watching", None)
+            if job["path"] in {"/scrobble/stop", "/scrobble/pause"} and result.get(
+                "action"
+            ) not in {"expired", "manual_unwatched", "local_deleted"}:
+                self.clear_watching_markers(ledger, job["key"])
             if result.get("action") not in {"expired", "manual_unwatched"}:
                 ledger["last_success"] = iso_time(self.clock())
             ledger["last_error"] = (
@@ -1161,15 +1555,13 @@ class Engine(ActivityLog, Recovery):
                 await self.initialize()
                 await self.deliver_ready(await self.store.scopes("delivery", entity="member"))
                 work = await self.store.scopes("delivery", entity="member")
-                delay = (
-                    max(
-                        1,
-                        min(self.due_at(int(s.split(":", 1)[1]), m) for s, m in work.items())
-                        - self.clock(),
-                    )
-                    if work
-                    else None
-                )
+                deadlines = [
+                    self.due_at(int(scope.split(":", 1)[1]), marker)
+                    for scope, marker in work.items()
+                ]
+                if self.watching_migration_due is not None:
+                    deadlines.append(self.watching_migration_due)
+                delay = max(1, min(deadlines) - self.clock()) if deadlines else None
                 failures = 0
                 try:
                     await asyncio.wait_for(self.wake.wait(), timeout=delay)

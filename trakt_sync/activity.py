@@ -1,4 +1,4 @@
-"""供管理员查看的有限发送记录；与可靠投递队列分开，不暴露请求或账号凭据。"""
+"""供管理员查看的双向同步记录，与可靠任务分开。"""
 
 import json
 
@@ -58,24 +58,54 @@ def category(row):
     return "favorite" if row.get("event") == "favorited" else "playback"
 
 
+def watch_activity(
+    event_id, media, season, episode, watched_at, completed_at, *, event, state="sent", reason=None
+):
+    unit = {"season": season, "episode": episode} if media["kind"] == "tv" else None
+    return {
+        **describe({"media": media, "unit": unit}, event),
+        "id": event_id,
+        "direction": "outbound" if event == "history_export" else "inbound",
+        "category": "watched",
+        "occurred_at": watched_at,
+        "completed_at": completed_at,
+        "state": state,
+        "reason": reason,
+    }
+
+
+def activity_time(row):
+    return (row.get("completed_at") if row.get("direction") == "inbound" else None) or row.get(
+        "occurred_at", ""
+    )
+
+
 class ActivityLog:
     async def record_activity(self, member, event_id, **values):
-        # 展示记录写入失败不能打断可靠投递。上限与队列独立，保留最近 80 条。
+        await self.record_activities(member, [{"id": event_id, **values}])
+
+    async def record_activities(self, member, updates, *, inbound=False):
+        if not updates:
+            return
         try:
-            rows = await self.get(member, "activity", [])
-            previous = next((r for r in rows if r["id"] == event_id), {})
-            row = {**previous, "id": event_id, **values}
-            rows = [r for r in rows if r["id"] != event_id] + [row]
-            important = {r["id"] for r in rows if category(r) != "playback"}
-            keep = {r["id"] for r in [r for r in rows if r["id"] in important][-60:]}
-            keep.update(r["id"] for r in [r for r in rows if r["id"] not in important][-20:])
-            rows = [r for r in rows if r["id"] in keep]
+            key = "import_activity" if inbound else "activity"
+            by_id = {r["id"]: r for r in await self.get(member, key, [])}
+            for row in updates:
+                by_id[row["id"]] = {**by_id.pop(row["id"], {}), **row}
+            rows = list(by_id.values())
+            if inbound:
+                rows = sorted(rows, key=activity_time)[-60:]
+            else:
+                important = [r["id"] for r in rows if category(r) != "playback"]
+                playback = [r["id"] for r in rows if category(r) == "playback"]
+                keep = {*important[-60:], *playback[-20:]}
+                rows = [r for r in rows if r["id"] in keep]
             while len(json.dumps(rows, ensure_ascii=False).encode()) > 48000:
                 noise = next((i for i, r in enumerate(rows) if category(r) == "playback"), 0)
                 rows.pop(noise)
-            await self.set(member, "activity", rows)
+            await self.set(member, key, rows)
         except Exception:
-            self.log.warning("Trakt 发送详情暂未保存，投递队列不受影响")
+            self.log.warning("Trakt 同步活动暂未保存，同步任务不受影响")
 
     async def accounts(self):
         await self.initialize()
@@ -122,8 +152,13 @@ class ActivityLog:
         try:
             ledger = await self.ledger(member)
             history = await self.get(member, "activity", [])
+            inbound = {
+                r["id"]: r
+                for key in ("import_activity_backfill", "import_activity")
+                for r in await self.get(member, key, [])
+            }
         except ValueError:
-            return {"member_id": member, "records": [], "retained": 80}
+            return {"member_id": member, "records": [], "retained": 140}
         by_id = {row["id"]: row for row in history}
         live = []
         for state, jobs in (
@@ -194,5 +229,6 @@ class ActivityLog:
             and row.get("state") in ("sent", "skipped")
             and row.get("event") not in ("started", "progress")
         ]
-        rows = sorted(live + finished, key=lambda row: row.get("occurred_at", ""), reverse=True)
-        return {"member_id": member, "records": rows, "retained": 80}
+        imported = sorted(inbound.values(), key=activity_time, reverse=True)[:60]
+        rows = sorted(live + finished + imported, key=activity_time, reverse=True)
+        return {"member_id": member, "records": rows, "retained": 140}

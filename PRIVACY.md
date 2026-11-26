@@ -16,6 +16,12 @@ This plugin runs on your own MovieClaw server. It bundles only the public Client
 
 Retries use two read-only host metadata operations (`library.list`, `library.items.get`). Local media/file IDs are retained for matching; returned filesystem paths are not stored or accessed.
 
+## 正在观看 / Currently Watching
+
+在 Trakt 显示「正在观看」按成员设置，默认关闭。开启后插件向 Trakt 报告播放和停止，并可同步该次播放的续播进度。关闭后，插件仍向 Trakt 同步已完成的观看，MovieClaw 继续保存本地进度。关闭时，插件会清理可确认由自己开启的正在观看状态。
+
+Showing Currently Watching in Trakt is a per-member opt-in. When enabled, playback and stop events may send resume progress to Trakt. When disabled, completed viewings continue to sync and MovieClaw continues to save local playback progress. Turning the setting off can clear an active status that the plugin can verify it started.
+
 ## 0.3 历史与手动操作 / History and manual actions
 
 三个实时同步偏好在每个成员的插件 profile 中保存，默认关闭。开启后，手动标记向 Trakt 写入观看日期，手动取消已看删除对应电影／单集的全部 Trakt 观看记录，新增收藏加入 Watchlist。取消收藏不移除 Watchlist。
@@ -23,3 +29,9 @@ Retries use two read-only host metadata operations (`library.list`, `library.ite
 管理员在独立历史页手动扫描，经完整预览和 Confirm 后，网页逐批读取或写入。`playback.sync.catalog` 读取所选成员可见的库内影片、单集及观看事实；`playback.sync.import` 将匹配的 Trakt 原日期和重看事实导入所选成员。插件保存扫描计划、标题、日期、批次状态及去重回执供 History 查询；这些批次不属于最近 80 条活动的容量限制，断开账号后保留用于核对，但旧任务无法写入新绑定。另保存按成员、条目编号哈希与绑定代次隔离的取消已看及最近成功观看时间标记，防止旧事件或旧重试覆盖较新的操作；不包含文件路径或凭据。无文件系统权限，不读写视频。
 
 The three member-scoped preferences default off. Enabled manual unwatched actions remove all Trakt watches for the selected movie/episode; new favorites add to Watchlist. Administrator-triggered history transfers read local holdings/watch facts and Trakt history, preserve original dates/rewatches, and import only matched local units after preview and Confirm. Plans, titles, dates, batch outcomes and deduplication receipts persist separately from the bounded activity feed; disconnect retains this audit history while preventing old tasks from writing through a new binding. No filesystem access is granted.
+
+## 服务器后台导入 / Server-side automatic import
+
+后台导入默认关闭，由管理员按成员和当前 Trakt 连接开启。插件读取 Trakt 活动、每部作品的更新时间和历史。晚入库时只用插件存储中待匹配的观看记录。对非管理员成员，`members.show` 用于核实账号创建身份，只保留身份摘要。插件加密保存条目索引、待匹配记录和已处理的 Trakt 观看 ID。断开 Trakt 连接会清除后台导入授权及索引，已写入 MovieClaw 的观看事实保留。插件也保留本地取消已看的时间和条目标识摘要，用于尊重后来的本地操作。
+
+Automatic import is off by default and scoped to the opted-in member and connection. It reads Trakt activity, per-title update timestamps, and viewing history. Late arrivals are matched against pending records stored on the server. The plugin keeps encrypted checkpoint indexes, pending records, and processed Trakt history IDs scoped to the bound account. While the plugin is enabled, it keeps local unwatch timestamps under hashed item keys, including before a Trakt account is connected, to honor those choices on first import. A hashed receipt for a Trakt scrobble ID prevents importing the same MovieClaw play again. Disconnect clears the automatic import opt-in and indexes. MovieClaw retains viewing facts already imported into its catalog.

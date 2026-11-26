@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1
+
+- Show Trakt imports and manual history transfers in the activity feed, with direction and both watch and import timestamps. Recent inbound records have a separate retention budget.
+
+## 0.5.0
+
+- Add opt-in, per-member Trakt history import that runs on the MovieClaw server. Backfill existing history, check Trakt every five minutes and reconcile newly indexed movies and episodes after library events. Preserve Trakt's viewing dates and independently recorded rewatches.
+- Compare compact Trakt watch snapshots to find backdated changes and query affected entries. Reconcile visibility and inventory periodically, with a paginated fallback for initial setup, large changes or unavailable compact data.
+- Bind automatic writes to the chosen Trakt connection and MovieClaw member identity. Preserve newer local unwatch actions and use the host's dated, idempotent import with optimistic concurrency. Show import status and retry timing and provide an immediate check.
+
 ## 0.4.0 (2026-10-31)
 
 - Default foreground history creation to incremental sync, reusing the last successful scan cutoff per member, account binding and direction, including pre-upgrade batches. Add explicit full-scan buttons and show the selected range in history/details. Failed or cancelled tasks never advance the baseline.

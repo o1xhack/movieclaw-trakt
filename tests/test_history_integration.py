@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from .conftest import Health, Store
+from .conftest import Health
 
 pytestmark = pytest.mark.skipif(
     os.getenv("MOVIECLAW_HOST_QA") != "1", reason="isolated host integration"
@@ -24,6 +24,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
     from movieclaw_api.services.auth import issue_member_session_token, reset_auth_state
     from movieclaw_api.services.durable_events import DurableEvents
     from movieclaw_api.services.host_ops import HostOps
+    from movieclaw_api.services.plugin_data import PluginStore
     from movieclaw_api.services.plugin_routes import PluginRoutes
     from movieclaw_api.settings.store import reset_setting_store
     from movieclaw_db.crypto import reset_secret_box
@@ -42,6 +43,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
     from movieclaw_db.repositories.library_repo import LibraryRepository
     from movieclaw_kernel import DURABLE_EVENTS
     from movieclaw_kernel.testing import KernelHarness
+    from movieclaw_sdk.events import LIBRARY_FILES_ADDED, AddedFile, FilesAdded
     from movieclaw_sdk.ops import HOST_OPS
     from sqlalchemy import select
 
@@ -64,7 +66,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
 
     app = create_app()
     entry = importlib.import_module("trakt_sync.plugin")
-    store, engines, requests = Store(), [], []
+    engines, requests = [], []
     episode_rows = []
 
     class QuietEngine(Engine):
@@ -79,7 +81,17 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                 200, json={"user": {"username": "fixture-two", "ids": {"uuid": "fixture-two-uuid"}}}
             )
         if r.url.path == "/sync/last_activities":
-            return httpx.Response(200, json={"movies": {"watched_at": "2020-01-04T00:00:00Z"}})
+            return httpx.Response(
+                200,
+                json={
+                    "movies": {"watched_at": "2020-01-04T00:00:00Z"},
+                    "episodes": {"watched_at": "2020-01-04T00:00:00Z"},
+                },
+            )
+        if r.url.path.startswith("/sync/watched/"):
+            return httpx.Response(200, json={})
+        if r.url.path == "/search/tmdb/200":
+            return httpx.Response(200, json=[{"show": {"ids": {"tmdb": 200, "trakt": 800}}}])
         if r.method == "GET" and r.url.path == "/sync/history/movies":
             return httpx.Response(
                 200,
@@ -93,7 +105,10 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                 ],
                 headers={"X-Pagination-Page-Count": "1"},
             )
-        if r.method == "GET" and r.url.path == "/sync/history/episodes":
+        if r.method == "GET" and r.url.path in {
+            "/sync/history/episodes",
+            "/sync/history/shows/800",
+        }:
             return httpx.Response(200, json=episode_rows, headers={"X-Pagination-Page-Count": "1"})
         return httpx.Response(201, json={"added": {"movies": 1}})
 
@@ -101,6 +116,7 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
     monkeypatch.setattr(entry.net, "http_transport", lambda _: httpx.MockTransport(dispatch))
 
     async def scenario():
+        store = PluginStore(get_database(), "trakt-sync")
         async with get_database().session() as s:
             library = await LibraryRepository(s).create(
                 name="fixture", kind="movie", root_paths=[str(tmp_path)]
@@ -545,6 +561,119 @@ def test_matched_host_plugin_foreground_import_export_and_permissions(tmp_path, 
                         )
                     ).scalar_one()
                     assert native_state.last_played_at == precise
+
+                # The user opts in once. An old play still outside the library is left pending
+                # on Trakt, then the host's real file-event contract wakes the plugin.
+                episode_rows.append(
+                    {
+                        "id": 110,
+                        "watched_at": "2019-01-31T04:05:00Z",
+                        "show": {"ids": {"tmdb": 200, "trakt": 800}},
+                        "episode": {"season": 1, "number": 1},
+                    }
+                )
+                profile_url = "/api/v1/plugins/trakt-sync/profile?member_id=2"
+                profile = (await web.get(profile_url)).json()["preferences"]
+                assert not profile["automatic_import"]
+                assert not (await store.get("background_import", scope="member:2"))
+                response = await web.put(
+                    profile_url,
+                    json={
+                        **profile,
+                        "automatic_import": True,
+                        "manual_unwatched": False,
+                    },
+                )
+                assert response.status_code == 200, response.text
+
+                from movieclaw_api.schemas.playback_sync import SyncImportIn
+
+                guarded_host = "expected_member_created_at" in SyncImportIn.model_fields
+
+                async def checked(previous=None):
+                    async with asyncio.timeout(5):
+                        while True:
+                            state = (await web.get(profile_url)).json()["background_import"]
+                            if state["error"] or (
+                                state["last_checked"] and state["last_checked"] != previous
+                            ):
+                                return state
+                            await asyncio.sleep(0.02)
+
+                first_check = await checked()
+                if not guarded_host:
+                    assert "版本暂不支持成员后台导入" in first_check["error"]
+                    assert first_check["imported"] == 0
+                    return
+                assert not first_check["error"]
+                assert first_check["imported"] == 0
+                async with get_database().session() as s:
+                    files = [
+                        LibraryFile(
+                            library_id=library.id,
+                            media_item_id=show_id,
+                            season_number=1,
+                            episode_number=n,
+                            file_path=str(tmp_path / f"s1e{n}.mkv"),
+                            size_bytes=1,
+                            source=FileSource.SCANNED,
+                            state=FileState.IN_PLACE,
+                        )
+                        for n in (1, 3, 4, 5)
+                    ]
+                    s.add_all(files)
+                    await s.flush()
+                    event_files = tuple(
+                        AddedFile(
+                            id=f.id, media_item_id=show_id, season=1, episode=f.episode_number
+                        )
+                        for f in files
+                    )
+                    await s.commit()
+                request_offset = len(requests)
+                h.events.emit(
+                    LIBRARY_FILES_ADDED, FilesAdded(library_id=library.id, files=event_files)
+                )
+                second_check = await checked(first_check["last_checked"])
+                assert not second_check["error"]
+                assert second_check["imported"] == 1
+                activity = (await web.get("/api/v1/plugins/trakt-sync/activity?member_id=2")).json()
+                incoming = [row for row in activity["records"] if row.get("direction") == "inbound"]
+                assert incoming[0]["event"] == "automatic_import"
+                assert incoming[0]["title"] == "Series" and incoming[0]["episode"] == 1
+                assert incoming[0]["occurred_at"] == "2019-01-31T04:05:00Z"
+                assert datetime.fromisoformat(
+                    incoming[0]["completed_at"]
+                ) <= datetime.fromisoformat(second_check["last_imported"])
+                assert any(
+                    row["event"] == "history_import" and row["episode"] == 2 for row in incoming
+                )
+                assert any(row["event"] == "history_export" for row in activity["records"])
+                assert not any(
+                    r.url.path.startswith("/sync/history/") for r in requests[request_offset:]
+                )
+                assert all(r.method == "GET" for r in requests[request_offset:])
+                async with get_database().session() as s:
+                    watched_episodes = list(
+                        (
+                            await s.execute(
+                                select(PlaybackState)
+                                .where(PlaybackState.media_item_id == show_id, PlaybackState.played)
+                                .order_by(PlaybackState.episode_number)
+                            )
+                        ).scalars()
+                    )
+                    assert [(p.member_id, p.episode_number) for p in watched_episodes] == [
+                        (2, 1),
+                        (2, 2),
+                    ]
+                    assert watched_episodes[0].last_played_at == datetime(2019, 1, 31, 4, 5)
+
+                response = await web.put(profile_url, json={**profile, "automatic_import": False})
+                assert response.status_code == 200, response.text
+                assert (
+                    await web.post("/api/v1/plugins/trakt-sync/background-import?member_id=2")
+                ).status_code == 409
             await h.unmount(fiber)
             await events.close()
 

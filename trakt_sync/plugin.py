@@ -8,6 +8,7 @@ from movieclaw_api.plugins.keys import PLUGIN_DATA, PLUGIN_HEALTH, PLUGIN_ROUTES
 from movieclaw_kernel import DURABLE_EVENTS
 from movieclaw_sdk import Context, net, plugin
 from movieclaw_sdk.events import (
+    LIBRARY_FILES_ADDED,
     LIBRARY_ITEM_FAVORITED,
     PLAYBACK_COMPLETED,
     PLAYBACK_MARKED_PLAYED,
@@ -16,11 +17,12 @@ from movieclaw_sdk.events import (
     PLAYBACK_STARTED,
     PLAYBACK_STOPPED,
 )
-from movieclaw_sdk.ops import HOST_OPS
+from movieclaw_sdk.ops import HOST_OPS, OpsError
 from pydantic import BaseModel, Field, SecretStr
 
 from .actions import Actions
 from .application import application_credentials
+from .background import BackgroundImport, RetryScan, Superseded
 from .client import TraktClient, TraktError
 from .engine import Engine
 from .policy import iso_time
@@ -61,6 +63,7 @@ class Settings(BaseModel):
         "library.items.get",
         "playback.sync.catalog",
         "playback.sync.import",
+        "members.show",
     ),
 )
 async def apply(ctx: Context):
@@ -83,19 +86,27 @@ async def apply(ctx: Context):
     routes = ctx.use(PLUGIN_ROUTES)
     transfers = Transfers(engine, ops)
     actions = Actions(engine)
+    background = BackgroundImport(engine, ops)
     ctx.task(actions.run(), name="trakt-actions")
+    ctx.task(background.run(), name="trakt-background-import")
+
+    async def files_added(_event):
+        background.inventory_changed()
+
+    ctx.on(LIBRARY_FILES_ADDED, files_added)
 
     def manual_listener(kind):
         async def receive(event):
             delivery = ctx.delivery
             if delivery and delivery.origin.is_plugin(PLUGIN_ID):
                 return
+            payload = event.model_dump(mode="json")
+            when = delivery.occurred_at if delivery else iso_time(engine.clock())
             await actions.automatic(
-                kind,
-                event.model_dump(mode="json"),
-                delivery.event_id if delivery else uuid.uuid4().hex,
-                delivery.occurred_at if delivery else iso_time(engine.clock()),
+                kind, payload, delivery.event_id if delivery else uuid.uuid4().hex, when
             )
+            if kind == "marked_unplayed":
+                await background.remember_unwatch(payload, when)
 
         return receive
 
@@ -192,9 +203,12 @@ async def apply(ctx: Context):
             False, description="放弃无法保存的旧导入身份；重绑后可能重复导入，须额外确认"
         ),
     ) -> dict:
-        return await engine.disconnect(
+        result = await engine.disconnect(
             member_id, allow_legacy_identity_loss=allow_legacy_identity_loss
         )
+        if result.get("disconnected"):
+            await background.forget(member_id)
+        return result
 
     @router.post("/retry", operation_id="plugins.trakt-sync.retry", summary="重试匹配失败的记录")
     async def retry(member_id: int = Query(0, ge=0)) -> dict:
@@ -248,6 +262,7 @@ async def apply(ctx: Context):
         return {
             "member_id": member,
             "preferences": (await preferences(engine, member)).model_dump(),
+            "background_import": await background.status(member),
         }
 
     @router.put(
@@ -256,8 +271,53 @@ async def apply(ctx: Context):
     async def save_profile(payload: Preferences, member_id: int = Query(0, ge=0)):
         member = member_id
         async with engine.locks[member]:
-            await engine.set(member, "profile", payload.model_dump())
+            old = await preferences(engine, member)
+            changes = payload.model_dump(exclude_unset=True)
+            payload = old.model_copy(update=changes)
+            binding = None
+            if payload.automatic_import and not old.automatic_import:
+                if not engine.enabled or not (await engine.status(member))["connected"]:
+                    raise HTTPException(409, "请先为此成员连接 Trakt 并启用插件")
+                account = await engine.get(member, "account")
+                try:
+                    owner = await background.member_identity(member)
+                except (OpsError, RetryScan) as exc:
+                    raise HTTPException(
+                        409, "无法核对 MovieClaw 成员，请检查成员与插件权限"
+                    ) from exc
+                binding = {"generation": account["generation"], "member": owner}
+            # Keep the v0.4 profile shape so a host package rollback can still read it.
+            await engine.set(
+                member,
+                "profile",
+                payload.model_dump(exclude={"automatic_import", "report_watching"}),
+            )
+            if "report_watching" in changes:
+                await engine.set(member, "report_watching", payload.report_watching)
+                if not payload.report_watching:
+                    await engine.disable_watching(member)
+            if binding:
+                await engine.set(member, "automatic_import_binding", binding)
+            elif old.automatic_import and not payload.automatic_import:
+                await store.delete("automatic_import_binding", scope=engine.scope(member))
+        if payload.automatic_import and not old.automatic_import:
+            background.request(member)
         return {"member_id": member, "preferences": payload.model_dump()}
+
+    @router.post(
+        "/background-import",
+        operation_id="plugins.trakt-sync.background-import.request",
+        summary="立即检查 Trakt 和本地媒体库",
+    )
+    async def background_request(member_id: int = Query(0, ge=0)):
+        async with engine.locks[member_id]:
+            account = await engine.get(member_id, "account", {})
+            try:
+                await background.account(member_id, account.get("generation"))
+            except Superseded:
+                raise HTTPException(409, "请先连接 Trakt 并开启后台导入") from None
+            background.request(member_id)
+        return {"queued": True}
 
     @router.post(
         "/actions/{task_id}/{command}",
@@ -334,6 +394,4 @@ async def apply(ctx: Context):
             raise HTTPException(409, str(exc)) from None
 
     routes.mount(ctx, router, zone="admin")
-    ctx.logger.info(
-        "Trakt 插件已加载；使用现有事件，管理员按成员管理独立同步偏好；历史同步由网页扫描、确认后逐批执行"
-    )
+    ctx.logger.info("Trakt 插件已加载，管理员可按成员开启后台导入或使用手动历史同步")

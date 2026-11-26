@@ -28,6 +28,11 @@ class Store:
     async def delete(self, key, *, scope="global"):
         return self.data.pop((scope, key), None) is not None
 
+    async def items(self, *, scope="global"):
+        return {
+            key: copy.deepcopy(value) for (owner, key), value in self.data.items() if owner == scope
+        }
+
     async def scopes(self, key, *, entity=None):
         return {
             scope: copy.deepcopy(value)
@@ -60,7 +65,7 @@ def event():
 async def harness():
     clients = []
 
-    async def make(handler=None):
+    async def make(handler=None, *, report_watching=True):
         clock = [1800000000.0]
         requests = []
 
@@ -103,6 +108,8 @@ async def harness():
             },
             secret=True,
         )
+        if report_watching:
+            await engine.set(0, "report_watching", True)
         return engine, store, clock, requests
 
     yield make

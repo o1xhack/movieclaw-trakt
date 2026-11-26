@@ -32,6 +32,11 @@ class Store:
     async def delete(self, key, *, scope="global"):
         return self.data.pop((scope, key), None) is not None
 
+    async def items(self, *, scope="global"):
+        return {
+            key: copy.deepcopy(value) for (owner, key), value in self.data.items() if owner == scope
+        }
+
     async def scopes(self, key, *, entity=None):
         self.scans.append(key)
         return {
@@ -82,6 +87,7 @@ class TrackingTests(unittest.IsolatedAsyncioTestCase):
             "client_id": "fixture-client",
         }
         await self.engine.set(0, "account", self.account, secret=True)
+        await self.engine.set(0, "report_watching", True)
         self.event = {
             "member_id": 0,
             "media": {"id": 7, "kind": "movie", "tmdb_id": 11},

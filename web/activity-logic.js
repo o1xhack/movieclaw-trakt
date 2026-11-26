@@ -6,11 +6,11 @@ const ActivityLogic = {
     if (row.event === "favorited") return "favorite";
     return "playback";
   },
-  matches(row, state="all", type="important") {
+  matches(row, state="all", type="important", direction="all") {
     const category = this.category(row);
     const matchesType = type === "all" || (type === "important" ? category !== "playback" : category === type);
     const matchesState = state === "all" || (state === "pending" && ["queued","retrying"].includes(row.state)) || (state === "failed" && ["failed","blocked"].includes(row.state)) || (state === "sent" && row.state === "sent");
-    return matchesType && matchesState;
+    return matchesType && matchesState && (direction === "all" || (row.direction || "outbound") === direction);
   }
 };
 if (typeof module !== "undefined") module.exports = ActivityLogic;

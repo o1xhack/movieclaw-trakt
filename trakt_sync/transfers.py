@@ -8,6 +8,7 @@ import uuid
 
 from movieclaw_sdk.ops import OpsError
 
+from .activity import watch_activity
 from .client import TraktError
 from .policy import history_body, identity, iso_time, matches, timestamp, trakt_minute
 
@@ -631,6 +632,28 @@ class Transfers:
                     raise TraktError(422)
             await self.store.set(
                 minute_key(row), fingerprint("export", row), scope=self.scope(task)
+            )
+        inbound = task["direction"] == "import"
+        if not inbound or outcome["status"] == "applied":
+            event = "history_import" if inbound else "history_export"
+            event_id = (
+                "import:" + row["source_id"] if inbound else "export:" + fingerprint("export", row)
+            )
+            await self.e.record_activities(
+                task["member_id"],
+                [
+                    watch_activity(
+                        event_id,
+                        row["media"],
+                        row["season"],
+                        row["episode"],
+                        row["watched_at"],
+                        outcome["state_version"] if inbound else iso_time(self.e.clock()),
+                        event=event,
+                        reason="已核对 Trakt 中存在这条记录" if not inbound and exists else None,
+                    )
+                ],
+                inbound=inbound,
             )
         await self.receipt(task, row, write=True)
         row.update(state="sent", uncertain=False)
