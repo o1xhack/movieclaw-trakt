@@ -3,8 +3,9 @@ from collections import Counter
 
 import httpx
 import pytest
+from movieclaw_sdk.ops import OpsError
 
-from trakt_sync.background import BackgroundImport
+from trakt_sync.background import BackgroundImport, MemberUnavailable, RetryScan
 from trakt_sync.policy import identity, iso_time, timestamp
 from trakt_sync.preferences import preferences
 
@@ -314,6 +315,70 @@ async def test_explicit_unwatch_before_connection_outweighs_later_favorite(harne
     assert await worker.protected(0, "admin", unit, item, "2024-12-31T00:00:00Z")
     unit["watches"] = [{"basis": "import", "watched_at": "2024-12-31T00:00:00Z"}]
     assert not await worker.protected(0, "admin", unit, item, "2025-01-02T00:00:00Z")
+
+
+@pytest.mark.parametrize("unavailable", ["deleted", "disabled"])
+async def test_unwatch_replay_acknowledges_unavailable_member(harness, unavailable):
+    engine, _, _, _ = await harness()
+    unit = local_episode(1)
+    member = 2
+    event = {"member_id": member, "media": unit["media"], "units": [unit]}
+    when = "2025-01-01T00:00:00Z"
+    host = Host([unit])
+
+    class UnavailableHost:
+        async def call(self, op, body):
+            assert (op, body) == ("members.show", {"member_id": member})
+            if unavailable == "deleted":
+                raise OpsError(404, "RESOURCE_NOT_FOUND", "member not found")
+            return {"id": member, "status": "disabled", "created_at": host.member_created}
+
+    worker = BackgroundImport(engine, UnavailableHost())
+    assert not await engine.get(member, "automatic_import_binding")
+    await worker.remember_unwatch(event, when)
+
+    active = BackgroundImport(engine, host)
+    owner = await active.member_identity(member)
+    item = identity({"media": unit["media"], "unit": unit})
+    assert await active.protected(member, owner, unit, item, when) == (unavailable == "disabled")
+    with pytest.raises(MemberUnavailable):
+        await worker.verify_member(member)
+
+
+async def test_unwatch_replay_discards_events_from_before_member_creation(harness):
+    engine, _, _, _ = await harness()
+    unit = local_episode(1)
+    member = 2
+    worker = BackgroundImport(engine, Host([unit]))
+    owner = await worker.member_identity(member)
+    item = identity({"media": unit["media"], "unit": unit})
+    event = {"member_id": member, "media": unit["media"], "units": [unit]}
+    when = "2019-12-31T23:59:59Z"
+    await worker.remember_unwatch(event, when)
+    assert not await worker.protected(member, owner, unit, item, when)
+
+
+@pytest.mark.parametrize("failure", ["temporary", "missing_identity", "wrong_member"])
+async def test_unwatch_replay_retries_unconfirmed_member(harness, failure):
+    engine, _, _, _ = await harness()
+    unit = local_episode(1)
+    member = 2
+
+    class UnconfirmedHost:
+        async def call(self, op, body):
+            assert (op, body) == ("members.show", {"member_id": member})
+            if failure == "temporary":
+                raise OpsError(503, "UNAVAILABLE", "retry")
+            if failure == "wrong_member":
+                return {"id": 3, "status": "disabled"}
+            return {"id": member, "status": "active"}
+
+    worker = BackgroundImport(engine, UnconfirmedHost())
+    with pytest.raises(OpsError if failure == "temporary" else RetryScan):
+        await worker.remember_unwatch(
+            {"member_id": member, "media": unit["media"], "units": [unit]},
+            "2025-01-01T00:00:00Z",
+        )
 
 
 async def test_catalog_removal_reconciles_surviving_previously_ambiguous_episode(harness):

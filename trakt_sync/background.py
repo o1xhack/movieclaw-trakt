@@ -28,6 +28,10 @@ class RetryScan(Exception):
     """A snapshot changed during reconciliation."""
 
 
+class MemberUnavailable(RetryScan):
+    """MovieClaw confirmed that the member was deleted or disabled."""
+
+
 def external_ids(item):
     return item.get("movie", item.get("show", {})).get("ids", {})
 
@@ -113,12 +117,23 @@ class BackgroundImport:
             raise Superseded
         return account
 
-    async def member_stamp(self, member):
+    async def member_stamp(self, member, *, allow_disabled=False):
         if member == 0:
             return "admin", None
-        profile = await self.ops.call("members.show", {"member_id": member})
-        if profile.get("id") != member or profile.get("status") != "active":
-            raise RetryScan("MovieClaw 成员当前不可用")
+        try:
+            profile = await self.ops.call("members.show", {"member_id": member})
+        except OpsError as exc:
+            if exc.status == 404 and exc.code == "RESOURCE_NOT_FOUND":
+                raise MemberUnavailable("MovieClaw 成员当前不可用") from exc
+            raise
+        if profile.get("id") != member:
+            raise RetryScan("无法确认 MovieClaw 成员身份")
+        status = profile.get("status")
+        if status == "disabled":
+            if not allow_disabled:
+                raise MemberUnavailable("MovieClaw 成员当前不可用")
+        elif status != "active":
+            raise RetryScan("无法确认 MovieClaw 成员身份")
         created = profile.get("created_at")
         if not isinstance(created, str) or not created:
             raise RetryScan("无法确认 MovieClaw 成员身份")
@@ -146,7 +161,13 @@ class BackgroundImport:
         async with self.e.locks[member]:
             if not self.e.enabled:
                 return
-            owner = await self.member_identity(member)
+            try:
+                # Disabled members retain their playback state when they are re-enabled.
+                owner, created = await self.member_stamp(member, allow_disabled=True)
+            except MemberUnavailable:
+                return
+            if created is not None and timestamp(when) < timestamp(created):
+                return
             media = event["media"]
             for unit in event.get("units") or [None]:
                 item = identity({"media": media, "unit": unit})
